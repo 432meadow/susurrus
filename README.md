@@ -29,7 +29,8 @@ with a tiny runner (`scripts/testrunner/main.swift`). Pass swift-testing flags t
 engine at zero volume. The tag-writing tests write only to generated files in a temp folder.
 
 To try a build without touching your real library, set `SUSURRUS_SUPPORT_DIR` to a scratch folder
-(it stands in for `~/Library/Application Support`).
+(it stands in for `~/Library/Application Support`; such a build also keeps its own Soulseek
+password in the keychain).
 
 ## Releases and updates
 
@@ -60,14 +61,26 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
 **Library**
 - **Add to Library** (⌘O, or drag files/folders onto the window) and **watched folders**
   (Settings ▸ Library), rescanned at launch, when a volume mounts, and every 30 minutes. Tags are
-  read with AVFoundation; untagged files fall back to `Artist/Album/NN Title` folder layout.
+  read with AVFoundation; untagged files fall back to `Artist/Album/NN Title` folder layout. Adds
+  made while a scan runs wait their turn. A rescan also re-reads the files another app changed
+  since they were read (their date or size differs, which comes with the folder listing): tags the
+  file has replace the library's, while tags it lacks, or ones only guessed from its name, leave
+  the library's alone, since they can be edits that were never written into the file. Files that
+  can't be read as audio are remembered and left alone until they change.
+- **Activity**: whatever runs in the background (adding files, writing tags, detecting BPM or
+  keys, finding covers, checking for missing files, imports) shows as a progress ring in the
+  toolbar on every pane; click it for each job's progress and a Stop button.
+- **Notices**: errors and import summaries appear in a corner of the window instead of in dialogs,
+  so the mixer stays usable while they're up; errors stay until dismissed, the rest fade. Open and
+  save panels don't block the window either.
 - Views: All Tracks, **Albums** (cover grid), **Artists** (see below), **Browse** (Genre → Artist →
   Album columns).
 - Built-in lists: **Recently Added** and **Recently Played** (last 30 days), **History** (every
   play, newest first, seeded with each track's last play on upgrade; right-click ▸ Clear
   History), **Duplicates** (same artist and title ignoring case/accents/punctuation, lengths
   within 2 s, grouped together) and **Missing Files** (only shown when there are some).
-- Search across title/artist/album/genre/composer (every word must match; `-word` excludes,
+- Search across title/artist/album/genre/composer, ignoring case and accents ("bjork" finds Björk;
+  every word must match; `-word` excludes,
   `"quoted phrases"` stay together) with field scopes: `artist:`, `title:`, `album:`,
   `albumartist:`, `genre:`, `composer:`, `comment:`, `grouping:`, `kind:flac`, `file:`;
   numbers `bpm:120-128`, `rating:>=4`, `year:<1990`, `plays:0`, `track:`, `disc:`, `bitrate:`,
@@ -106,8 +119,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
 - Track list: right-click the header to show/hide columns (extra ones: Album Artist, Composer,
   Grouping, Comment, #, Disc, Last Played, Kind, Bit Rate, Sample Rate, Size); type to jump to a
   row in the sorted column (title otherwise).
-- **Missing files**: every file is checked in the background a minute after launch and whenever
-  a volume mounts or unmounts (File ▸ Check for Missing Files to run it now). Missing tracks are
+- **Missing files**: every file is checked in the background a minute after launch, and the files
+  on a volume whenever it mounts or unmounts (File ▸ Check for Missing Files to run it now). Each
+  folder is listed once rather than every file asked for: one round trip per folder on a share. Missing tracks are
   dimmed with a ⚠; tracks on an unmounted volume are dimmed with a drive icon instead (one check
   per volume, not per file). Files that moved but still resolve through their bookmark get their
   path fixed silently. **Locate File…** (Track menu or right-click) relinks a missing track and
@@ -116,9 +130,15 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   deletes tracks from susurrus's database after a confirmation. The files are never touched.
 
 **Editing** (saved to the susurrus database; optionally also written into the files, see below)
-- **Get Info** (⌘I) for one or many tracks; mixed values stay untouched unless changed.
+- **Get Info** (⌘I) for one or many tracks; mixed values (shown as "Mixed", the rating too) stay
+  untouched unless changed, and emptying a Mixed field clears it on every track.
+- The right-click menu is the same in the track list, an album's tracks (Albums, artist pages) and
+  Stats; album covers share their own. Track menu commands act on what's selected in the list on
+  screen, so switching views clears the selection.
+- Space plays and pauses anywhere in the window except while typing; ⌘F goes to the search field,
+  which shows on the panes it filters (tracks, albums, artists, browser).
 - Ratings: click stars in the table, Track ▸ Rating, or ⌘0–⌘5.
-- Playlists: new (⌘N), from selection (⇧⌘N), folders, rename, delete, drag tracks onto a
+- Playlists: new (⌘N, with the name ready to type), from selection (⇧⌘N), folders, rename, delete, drag tracks onto a
   playlist, drag playlists into folders, reorder by dragging rows (in playlist order),
   remove (⌘⌫).
 - **Smart playlists** (⌥⌘N): native rule editor with a live match count.
@@ -164,7 +184,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   menu or right-click, or File ▸ Find Missing Covers for All Albums) looks for each album with
   no cover (embedded, fetched, or a cover.jpg/folder.jpg/front.jpg next to the files, which
   susurrus now also shows) and takes the cover of the MusicBrainz release group with exactly
-  that title by that artist, in the background with progress in the subtitle.
+  that title by that artist, in the background with progress in the subtitle. With "Write tags to
+  files" on it first asks whether to embed the covers too, since that rewrites every track of each
+  album that gets one.
 
 **Import and export** (File menu; nothing here reads audio, it all comes from the database)
 - **M3U playlists**: **Export Playlist…** (File menu, or right-click a playlist) saves a playlist,
@@ -201,7 +223,8 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
 **Playback**
 - Gapless playback; shuffle (⌥⌘S), repeat off/all/one (⌘R).
 - **Up Next** panel (⌥⌘U): Play Next (⌥↩), Add to Queue (⌥⇧↩), reorder, remove, jump.
-- Play counts and last-played are recorded after half a track (or 4 minutes).
+- Play counts and last-played are recorded once half a track (or 4 minutes) has actually been
+  heard: seeking ahead, or resuming a track restored past its middle, doesn't count one.
 - 10-band **equalizer** with presets (⌥⌘E).
 - Two-deck **mixer** (⇧⌘M) for blending tracks by hand: load a deck from the track menu (⌥⌘1 / ⌥⌘2)
   or by dragging a track onto it. Equal-power crossfader, auto crossfade over 4–32 s (⇧⌘X),
@@ -230,12 +253,19 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   report's summary. Paths and the Mac's user and computer names are taken out, the diagnostics
   can be edited before sending, and susurrus itself sends nothing. The errors come from a small
   log in `~/Library/Logs/susurrus/events.log` that survives a crash.
-- Queue and position are restored (paused) on the next launch.
+- Queue and position are restored (paused) on the next launch; nothing is read from the share
+  until Play. A paused player lets the audio device go after 20 s, so the Mac and Bluetooth or
+  AirPlay speakers can sleep. After a change of output (headphones unplugged, an AirPlay switch)
+  the track carries on from where it was.
 
 **Soulseek** (phases 1–4: search + downloads + sharing + messages)
 - Native Soulseek client (sidebar ▸ Network ▸ Soulseek): connect with a username/password set in
-  Settings ▸ Soulseek (password lives in the keychain; a brand-new username is auto-registered by
-  the network on first login) and search the network. Results stream in from peers with format,
+  Settings ▸ Soulseek (saved with Return or Save; the password lives in the keychain; a brand-new
+  username is auto-registered by the network on first login) and search the network. A dropped
+  connection is retried after about 5 s, then less and less often (at most every 5 minutes), and
+  at once when the Mac wakes or the network comes back; after the account logs in elsewhere
+  susurrus says so and stays offline. A search with no results for 45 s says so, with Search
+  Again and Add to Wishlist. Results stream in from peers with format,
   bitrate/bit depth, length, size, free-slot and speed columns.
 - **Downloads**: double-click a result (or right-click — multi-select works, and "Download
   Folder" grabs a whole album) to queue it with the peer. The **Downloads tab** (next to Search,
@@ -243,21 +273,30 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   uploader, place in their queue, transferring with progress, done, or failed (with the peer's
   reason, e.g. "File not shared.") — plus an Uploads section for files others fetch from you.
   Files land in Settings ▸ Soulseek's download folder (default `~/Music/Soulseek`), inside their
-  remote folder name so albums stay together; transfers write to a `.part` file, resume from
-  where they stopped (Retry in the row's context menu), and finished folders are **imported into
-  the library automatically** through the watched-folder scanner.
+  remote folder name so albums stay together (a "CD1"/"Disc 2" folder keeps its album folder:
+  `Album/CD1/`). Partial files collect in the hidden `.incomplete` folder, one per user and file,
+  resume from where they stopped (Retry in the row's context menu) and restart if one is bigger
+  than the file; finished files never replace an existing one and are quarantined like a
+  browser's downloads, and finished folders are **imported into the library automatically**.
+  Cancel All and Cancel Folder ask first.
 - The protocol (message layouts, zlib-wrapped search results, the direct + server-relayed peer
   connection dance, and the QueueUpload → TransferRequest → raw-byte `F` connection transfer
   flow) follows Nicotine+ 3.3.10's `doc/SLSKPROTOCOL.md`, implemented from scratch in
   `Sources/Susurrus/Soulseek/` on Network.framework + BSD sockets — no dependencies. The peer
   listener uses BSD sockets because `NWListener` fails (EINVAL) on Macs with certain network
   filters; without a reachable port everything still works through server-relayed connections.
-- **Sharing**: pick a shared folder in Settings ▸ Soulseek. It's scanned off the main thread
-  (library tracks contribute bitrate/duration/bit-depth attributes), susurrus joins the
-  distributed network as a leaf (adopts a parent, takes no children), answers matching searches
-  directly to the searcher, serves browse requests, and uploads queued files over `F`
-  connections — two slots, a queue with position replies, resume offsets honored. Search
-  matching is all-words-must-match with `-word` exclusions, like other clients.
+  A peer is dialed and asked to connect back at the same time, and whichever arrives first is
+  used, so firewalled peers are reached in seconds.
+- **Sharing**: pick a shared folder in Settings ▸ Soulseek. The share is built from the library's
+  tracks in that folder (with their bitrate, length and bit depth), so it's up at once without
+  reading the share; files the library doesn't have are found by a walk of the folder in the
+  background the first time, once a day, or on Rescan, and remembered in
+  `~/Library/Application Support/susurrus/Soulseek/Share.json`. susurrus joins the distributed
+  network as a leaf (adopts a parent, takes no children), answers matching searches directly to
+  the searcher, serves browse requests, and uploads queued files over `F` connections — two
+  slots, a queue with position replies, resume offsets honored. Search matching is whole words,
+  every one must match, with `-word` exclusions, like other clients; very long searches aren't
+  answered.
 - **Filters** above Search/Wishlist/Browse results: filter words (`-word` excludes), a format
   menu (Lossless, 320/256/192 kbps or better — lossless always passes), free-slot only, and
   **Group by folder**, which folds results into one row per user + remote folder (total size and
@@ -267,7 +306,8 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   messages are dropped. Settings ▸ Soulseek
   lists them with Unblock.
 - **Browse** tab (or right-click a result/transfer ▸ Browse *user*'s Files): fetches the user's
-  whole share (peer code 4 → 5, zlib file list; bare file names are joined to their folder).
+  whole share (peer code 4 → 5, zlib file list, up to 96 MB compressed; bare file names are joined
+  to their folder).
   Folders on the left with a filter, files on the right; right-click a folder to download it, or
   it and its subfolders.
 - **Wishlist** tab: saved searches (add there, or with the ☆ next to the search field). While
@@ -329,10 +369,15 @@ keep the audio data identical (MP4: every chunk offset still points at the same 
 AVFoundation reads the same duration).
 
 When the new MP3/FLAC tags fit in the space the old tag takes up (its padding absorbs the
-change, which is the usual case), only the tag is read and only the bytes that changed are
+change, which is the usual case), only the tag is read and only the byte ranges that changed are
 written back in place, then read back and compared (the old bytes are put back if they differ).
 The audio is never written to. Over a slow network share (~1.3 MB/s) that took writes from about a
-minute per file to a few seconds. If the original's size or modification date changed
+minute per file to a few seconds. In-place writes are capped at 64 KB in all: a bigger change takes
+the temp-copy path, so a connection that drops mid-write can't leave a tag half old and half new.
+To keep them small, FLAC comments that grow move into the padding (their old place becomes
+padding), so the cover doesn't move; an ID3 frame that changes size moves to the end of the tag,
+so the first such edit of a field that sits before a large cover goes through the temp copy and
+later edits of it are small. If the original's size or modification date changed
 meanwhile it's skipped. Otherwise permissions, creation date and extended attributes (Finder
 tags) are copied over and the copy is renamed over the original (atomic). The track that's
 playing is written once it stops playing.
@@ -357,41 +402,48 @@ Files on the Mac's own disks and external drives are played in place. Files on a
 volume (SMB, AFP, NFS) can arrive slowly (the share susurrus was developed against measured
 0.2–3 MB/s), so for those:
 - A track you start plays **straight from the share** if it's MP3/AAC/WAV/AIFF (needs ~40 KB/s),
-  so it starts as soon as the share responds. If it takes over 8 s the bar says
-  "Waiting for the network share…".
-- **Scrubbing shows a spinner while the share catches up**: after a seek in a streamed track,
-  a short probe segment is scheduled first; the loading wheel next to the title spins until that
-  probe's audio has actually played (and the "Waiting for the network share…" note appears if it
-  takes over 8 s).
+  so it starts as soon as the share responds, also when its copy is still under way (the copy
+  finishes in the background). If it takes over 8 s the bar says "Waiting for the network share…".
+- **Scrubbing shows a spinner while the share catches up**: after a seek in a streamed track (or
+  resuming after a seek while paused, or a restored position), a short probe segment is
+  scheduled first; the loading wheel next to the title spins until that probe's audio has
+  actually played (and the "Waiting for the network share…" note appears if it takes over 8 s).
 - **FLAC is copied locally first**: AudioToolbox scans FLAC files end to end for packets, which
   over the network stalled playback.
-- The **next track is copied** to `~/Library/Caches/susurrus/Playback` (last 8, cleared on
-  launch) in the background — after the current stream has had 20 s to settle — and chained
-  onto the audio node in the last ~12 s, so transitions are gapless and queue edits are free.
+- The **next track is copied** to `~/Library/Caches/susurrus/Playback` (shared with the mixer, up
+  to 1 GB, oldest out first, cleared on launch) in the background — after the current stream has
+  had 20 s to settle — and chained onto the audio node in the last ~12 s, so transitions are
+  gapless and queue edits are free. Copies run 1 MB at a time on threads of their own and stop
+  once their track is no longer current, next or on a deck.
+- If three files in a row won't open (the share is gone), playback goes back to where that began
+  and waits there, paused, with the queue and position kept; the bar says why.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `Sources/Susurrus/Library/` | SQLite wrapper, store (+ editing, history, listen log, removal, saved tag writes), listening stats, artist index and discography matching, MusicBrainz release matching, smart playlist predicates, tag reader, albums, artwork, BPM and key detection, search scopes, duplicate and missing-file checks |
-| `Sources/Susurrus/Library/TagWriting/` | ID3 / FLAC / MP4 tag writers, safe file replacement, background write queue |
-| `Sources/Susurrus/Playback/` | Player (queue, gapless, shuffle/repeat), two-deck mixer and track analysis (waveforms, beat grid), file cache, EQ, output devices, Now Playing |
+| `Sources/Susurrus/Library/` | SQLite wrapper, store (+ editing, scanning and file stamps, history, listen log, removal, saved tag writes), the one table of track columns, text folding (`TextKey`), blocking file work off the shared thread pool (`BlockingIO`), listening stats, artist index and discography matching, MusicBrainz release matching, smart playlist predicates, tag reader, albums, artwork, BPM and key detection, search scopes, duplicate and missing-file checks |
+| `Sources/Susurrus/Library/TagWriting/` | ID3 / FLAC / MP4 tag writers, safe file replacement, background write queue and its saved backlog |
+| `Sources/Susurrus/Playback/` | Player (queue, gapless, shuffle/repeat), two-deck mixer and track analysis (waveforms, beat grid), listens and play counts, shared file cache, EQ, output devices, Now Playing |
 | `Sources/Susurrus/Exchange/` | M3U playlists, Apple Music / iTunes `Library.xml` reader and import plan, Rekordbox XML writer, path matching, atomic export writes, remembered beat grids |
 | `Sources/Susurrus/Metadata/` | MusicBrainz / Wikipedia / ListenBrainz client for artist pages (rate limit, disk cache), MusicBrainz release search and Cover Art Archive covers |
-| `Sources/Susurrus/Soulseek/` | Soulseek client: wire codec, messages, client actor (server + peer connections), UI model, private conversations (saved to disk) |
+| `Sources/Susurrus/Soulseek/` | Soulseek client: wire codec, messages, sockets, deadline-aware waiters, transfer files, client actor (server + peer connections), UI model, share index, private conversations (saved to disk) |
 | `Sources/Susurrus/LegacyMigration.swift` | Takes over casting's folders, settings and Soulseek password on the first launch |
-| `Sources/Susurrus/AppModel*.swift` | App state, selection, actions and undo, scanning, library housekeeping, import and export, Look Up Album, covers and tidying Soulseek downloads |
+| `Sources/Susurrus/AppModel*.swift` | App state, selection, actions and undo, scanning, library housekeeping, import and export, Look Up Album, covers and tidying Soulseek downloads, notices and background activity |
 | `Sources/Susurrus/Updater.swift` | Sparkle in-app updates (Check for Updates…, automatic checks) |
 | `Sources/Susurrus/Reporting/` | Bug reports: event log, diagnostics, redaction, crash report summaries, the GitHub issue link |
-| `Sources/Susurrus/UI/` | Track table (NSTableView), sidebar, albums, browser, Up Next, Get Info, smart editor, EQ, mixer, Rekordbox export sheet, Soulseek (+ messages and user info), settings, menu bar |
+| `Sources/Susurrus/UI/` | Track table (NSTableView), shared track and album menus, sidebar, albums, browser, Up Next, Get Info, smart editor, EQ, mixer, import and export sheets, activity button and notices, Soulseek (+ messages and user info), settings, menu bar |
 | `Sources/ObjCSupport/` | Catches NSExceptions (predicate evaluation, audio graph connections) |
-| `Tests/SusurrusTests/` | 191 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, and saved conversations |
+| `Tests/SusurrusTests/` | 269 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, and saved conversations |
 
 ## Known issues
 
 - ID3v1 tags at the end of MP3s aren't updated. (Tag writes still queued at quit are saved in
-  the database and picked up at the next launch, unless Write tags to files was turned off.)
+  the database and picked up at the next launch, unless Write tags to files was turned off. They're
+  saved in batches off the main thread, a cover queued for many tracks is kept once in `Queued
+  Covers` next to the library, and when the queue empties a database with 64 MB or more unused is
+  compacted.)
 - The smart playlist match count can take a few seconds on the full library.
 - Ogg/Opus aren't playable (AVFoundation can't decode them; none are in the current library).
-- Output-device switching mid-track (headphones unplugged, AirPlay) is handled but not yet tested
-  on real hardware changes.
+- Output-device switching mid-track (headphones unplugged, AirPlay) is handled and covered by
+  tests that simulate the engine stopping, but not yet tested on real hardware changes.

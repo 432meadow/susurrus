@@ -5,8 +5,9 @@ import ImageIO
 ///
 /// Only the comment block (and, when the cover is edited, the front-cover PICTURE block) changes:
 /// comments for edited fields are replaced, all others (and the vendor string) are kept in order.
-/// Other metadata blocks (STREAMINFO, other pictures, seek table, …) are copied byte for byte; a PADDING block absorbs the size change when it can, so the audio
-/// frames usually stay at the same offset.
+/// Other metadata blocks (STREAMINFO, other pictures, seek table, …) are copied byte for byte, in
+/// order. Padding absorbs the size change when it can, so the audio frames usually stay at the same
+/// offset; for that the comment block may move into the padding (see `keepSize`).
 enum FLACTag: TagFormat {
     struct Block: Equatable {
         var type: UInt8
@@ -179,12 +180,7 @@ enum FLACTag: TagFormat {
                 blocks.insert(Block(type: 6, body: picture), at: index ?? afterLast)
             }
         }
-        // Let padding absorb the difference so the audio doesn't move.
-        func metadataSize(_ blocks: [Block]) -> Int { blocks.filter { $0.type != 1 }.reduce(0) { $0 + 4 + $1.body.count } }
-        let growth = metadataSize(blocks) - metadataSize(parsed.blocks)
-        if let padding = blocks.firstIndex(where: { $0.type == 1 }), blocks[padding].body.count >= growth {
-            blocks[padding].body = [UInt8](repeating: 0, count: blocks[padding].body.count - growth)
-        }
+        keepSize(&blocks, of: parsed.blocks)
 
         var out = Array(bytes[..<parsed.marker]) + Array("fLaC".utf8)
         for (index, block) in blocks.enumerated() {
@@ -192,6 +188,55 @@ enum FLACTag: TagFormat {
             out += [last | block.type] + [UInt8].be24(block.body.count) + block.body
         }
         return out + Array(bytes[parsed.audioStart...])
+    }
+
+    /// Lets padding take up a change in the metadata's size so the audio doesn't move, moving as
+    /// few other bytes as possible (the fast path rewrites only the bytes that differ). When only
+    /// the comments changed size:
+    /// 1. padding right after them gives or takes the difference;
+    /// 2. if they shrank by 4 bytes or more, the room left becomes new padding right after them;
+    /// 3. else they move into padding further on and their old place becomes padding of the same
+    ///    size, so the blocks in between (usually the cover) stay where they are;
+    /// 4. else the first padding with room takes the difference and moves right after them, so
+    ///    the next edit is case 1.
+    /// A cover change is taken up by the first padding with room, where it is. Without padding to
+    /// spare, the metadata changes size. Only comments and padding move, so all other blocks keep
+    /// their order (which `verify` requires).
+    private static func keepSize(_ blocks: inout [Block], of original: [Block]) {
+        func size(_ blocks: [Block]) -> Int { blocks.filter { $0.type != 1 }.reduce(0) { $0 + 4 + $1.body.count } }
+        func padding(_ count: Int) -> Block { Block(type: 1, body: [UInt8](repeating: 0, count: count)) }
+        let growth = size(blocks) - size(original)
+        guard growth != 0 else { return }
+        let oldComments = original.first { $0.type == 4 }
+        guard let comments = blocks.firstIndex(where: { $0.type == 4 }),
+              size([blocks[comments]]) - size(oldComments.map { [$0] } ?? []) == growth else {
+            if let index = blocks.firstIndex(where: { $0.type == 1 && $0.body.count >= growth }) {
+                blocks[index] = padding(blocks[index].body.count - growth)
+            }
+            return
+        }
+        if comments + 1 < blocks.count, blocks[comments + 1].type == 1, blocks[comments + 1].body.count >= growth {
+            blocks[comments + 1] = padding(blocks[comments + 1].body.count - growth)
+        } else if growth <= -4 {
+            blocks.insert(padding(-growth - 4), at: comments + 1)
+        } else if let target = blocks.indices.first(where: {
+            // Room for the comments, and for nothing or a whole padding block after them.
+            let room = blocks[$0].body.count - blocks[comments].body.count
+            return $0 > comments && blocks[$0].type == 1 && (room == 0 || room >= 4)
+        }) {
+            let moved = blocks[comments]
+            let rest = blocks[target].body.count - blocks[comments].body.count - 4
+            if rest >= 0 { blocks[target] = padding(rest) } else { blocks.remove(at: target) }
+            blocks.insert(moved, at: target)
+            if let oldComments {
+                blocks[comments] = padding(oldComments.body.count)
+            } else {
+                blocks.remove(at: comments)
+            }
+        } else if let index = blocks.firstIndex(where: { $0.type == 1 && $0.body.count >= growth }) {
+            let absorbing = padding(blocks.remove(at: index).body.count - growth)
+            blocks.insert(absorbing, at: blocks.firstIndex { $0.type == 4 }! + 1)
+        }
     }
 
     /// A front cover (picture type 3) with no description. Size and depth come from the image.

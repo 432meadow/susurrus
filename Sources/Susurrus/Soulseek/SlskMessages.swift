@@ -22,6 +22,7 @@ enum SlskServerCode: UInt32 {
     case ping = 32
     case sharedFoldersFiles = 35
     case getUserStats = 36
+    case relogged = 41
     case haveNoParent = 71
     case embeddedMessage = 93
     case acceptChildren = 100
@@ -30,6 +31,7 @@ enum SlskServerCode: UInt32 {
     case wishlistInterval = 104
     case branchLevel = 126
     case branchRoot = 127
+    case cantConnectToPeer = 1001
 }
 
 enum SlskServerMessage {
@@ -75,6 +77,15 @@ enum SlskServerMessage {
         body.string(username)
         body.string(connectionType)
         return frame(.connectToPeer, body)
+    }
+
+    /// Code 1001, sent: we couldn't answer a peer's indirect connection request (their
+    /// `ConnectToPeer`), so they can stop waiting for our pierce.
+    static func cantConnectToPeer(token: UInt32, username: String) -> Data {
+        var body = SlskWriter()
+        body.u32(token)
+        body.string(username)
+        return frame(.cantConnectToPeer, body)
     }
 
     /// Code 26. Lone "-" words are dropped, as in Nicotine+.
@@ -701,7 +712,8 @@ struct SlskTransferRequest {
         direction = try reader.u32()
         token = try reader.u32()
         path = try reader.string()
-        size = direction == 1 ? try reader.fileSize() : 0
+        // 0 when absent or implausible: the size from the search result stands.
+        size = direction == 1 ? (try reader.fileSize() ?? 0) : 0
     }
 }
 
@@ -770,6 +782,16 @@ struct SlskSearchResponse {
     var token: UInt32
     var results: [SlskSearchResult]
 
+    /// The search token, read from the start of the payload without inflating the rest — so
+    /// answers to searches nobody is waiting for cost next to nothing.
+    static func token(in payload: Data) -> UInt32? {
+        // A username long enough to push the token past this is no real username.
+        guard let head = try? SlskZlib.inflatePrefix(payload, count: 1024) else { return nil }
+        var reader = SlskReader(head)
+        _ = try? reader.string()
+        return try? reader.u32()
+    }
+
     init(parsing payload: Data) throws {
         var reader = SlskReader(try SlskZlib.inflate(payload))
         username = try reader.string()
@@ -793,7 +815,8 @@ struct SlskSearchResponse {
                 for _ in 0 ..< (try reader.u32()) {
                     attributes[try reader.u32()] = try reader.u32()
                 }
-                files.append(File(path: path, size: size, attributes: attributes))
+                // A file with an impossible size is garbage; leave it out.
+                if let size { files.append(File(path: path, size: size, attributes: attributes)) }
             }
             return files
         }
@@ -853,7 +876,7 @@ struct SlskSharedFileList: Sendable {
     var fileCount: Int { folders.reduce(0) { $0 + $1.files.count } }
 
     init(parsing payload: Data, username: String) throws {
-        var reader = SlskReader(try SlskZlib.inflate(payload))
+        var reader = SlskReader(try SlskZlib.inflate(payload, limit: SlskZlib.maxShareListSize))
         self.username = username
         var folders: [Folder] = []
         var nextID = 0
@@ -873,6 +896,7 @@ struct SlskSharedFileList: Sendable {
                 for _ in 0 ..< (try reader.u32()) {
                     attributes[try reader.u32()] = try reader.u32()
                 }
+                guard let size else { continue }  // an impossible size: garbage, left out
                 // Clients send bare file names here; a few send the whole path.
                 let fullPath = name.contains("\\") ? name : path + "\\" + name
                 files.append(SlskSearchResult(

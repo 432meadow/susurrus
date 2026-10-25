@@ -17,7 +17,7 @@ import Testing
 
     @Test func insertSkipsKnownPaths() throws {
         let added = try store.insert([ScannedTrack(path: "/music/1.mp3"), ScannedTrack(path: "/music/new.mp3")])
-        #expect(added == 1)
+        #expect(added.count == 1)
         #expect(try store.allPaths().count == 6)
     }
 
@@ -120,7 +120,7 @@ import Testing
         #expect(track.sampleRate == 44_100)
         #expect(track.channels == 2)
         // The temp dir is reached through the /var → /private/var symlink, so compare resolved paths.
-        #expect(AppModel.audioFiles(in: [folder.deletingLastPathComponent()]).map { $0.resolvingSymlinksInPath().path }
+        #expect(AppModel.audioFiles(in: [folder.deletingLastPathComponent()]).map { $0.url.resolvingSymlinksInPath().path }
                 == [url.resolvingSymlinksInPath().path])
     }
 

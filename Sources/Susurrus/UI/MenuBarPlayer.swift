@@ -13,7 +13,7 @@ struct MenuBarPlayer: View {
                     .frame(width: 64, height: 64)
                 VStack(alignment: .leading, spacing: 2) {
                     if let track = player.currentTrack {
-                        Text(track.title.isEmpty ? track.fileName : track.title).font(.headline).lineLimit(2)
+                        Text(track.displayTitle).font(.headline).lineLimit(2)
                         Text(track.displayArtist).foregroundStyle(.secondary).lineLimit(1)
                         Text(track.album).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     } else {
@@ -32,15 +32,21 @@ struct MenuBarPlayer: View {
                 Button { player.setShuffle(!player.shuffle) } label: {
                     Image(systemName: "shuffle").foregroundStyle(player.shuffle ? Palette.warm : .secondary)
                 }
+                .toggleAccessibility("Shuffle", isOn: player.shuffle)
                 Button { player.previous() } label: { Image(systemName: "backward.fill") }
+                    .accessibilityLabel("Previous")
                 Button { player.togglePlayPause() } label: {
                     Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").font(.title)
                 }
+                .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
                 Button { player.next() } label: { Image(systemName: "forward.fill") }
+                    .accessibilityLabel("Next")
                 Button { player.cycleRepeatMode() } label: {
                     Image(systemName: player.repeatMode == .one ? "repeat.1" : "repeat")
                         .foregroundStyle(player.repeatMode == .off ? .secondary : Palette.warm)
                 }
+                .accessibilityLabel("Repeat")
+                .accessibilityValue(player.repeatMode.rawValue)
             }
             .buttonStyle(.borderless)
             .font(.title3)
@@ -48,10 +54,7 @@ struct MenuBarPlayer: View {
 
             Divider()
             HStack {
-                Button("Show susurrus") {
-                    openWindow(id: "main")
-                    NSApp.activate(ignoringOtherApps: true)
-                }
+                Button("Show susurrus") { showMainWindow() }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
             }
@@ -60,5 +63,17 @@ struct MenuBarPlayer: View {
         }
         .padding(14)
         .frame(width: 300)
+    }
+
+    /// Brings the main window forward, or opens it if it was closed (a second one would share
+    /// the same model, sheets and all).
+    private func showMainWindow() {
+        if let window = model.mainWindow, window.isVisible || window.isMiniaturized {
+            window.deminiaturize(nil)
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            openWindow(id: "main")
+        }
+        NSApp.activate()
     }
 }

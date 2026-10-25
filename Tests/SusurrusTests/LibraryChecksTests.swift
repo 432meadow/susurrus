@@ -109,12 +109,37 @@ import Testing
             (4, "/Volumes/Share/y.mp3"),
             (5, "/Users/me/b.mp3"),
             (6, "/Users/me/c.mp3"),
-        ]) { path in
+        ], listFolder: { folder in
+            existing.filter { ($0 as NSString).deletingLastPathComponent == folder }.map { ($0 as NSString).lastPathComponent }
+        }, fileExists: { path in
             checked.append(path)
             return existing.contains(path)
-        }
+        })
         #expect(statuses == [2: .missing, 3: .offline, 4: .offline, 6: .missing])
         #expect(checked.filter { $0.hasPrefix("/Volumes/Share") } == ["/Volumes/Share"], "one check per unmounted volume")
+        #expect(!checked.contains("/Volumes/Music/a.mp3") && !checked.contains("/Users/me/b.mp3"), "listed files aren't asked for one by one")
+    }
+
+    @Test func listsEachFolderOnceAndAsksOnlyAboutUnlistedNames() {
+        var listed: [String] = []
+        var asked: [String] = []
+        let statuses = MissingFiles.check([
+            (1, "/music/Album/01 One.mp3"),
+            (2, "/music/Album/02 Two.mp3"),
+            (3, "/music/Album/03 Café.mp3"),   // listed in decomposed form
+            (4, "/music/Album/04 Four.MP3"),   // listed in another case
+            (5, "/music/Gone/01.mp3"),
+            (6, "/music/Gone/02.mp3"),
+        ], listFolder: { folder in
+            listed.append(folder)
+            return folder == "/music/Album" ? ["01 One.mp3", "02 Two.mp3", "03 Cafe\u{301}.mp3", "04 four.mp3"] : nil
+        }, fileExists: { path in
+            asked.append(path)
+            return path == "/music/Album/04 Four.MP3"
+        })
+        #expect(statuses == [5: .missing, 6: .missing])
+        #expect(listed.sorted() == ["/music/Album", "/music/Gone"])
+        #expect(asked.sorted() == ["/music/Album/04 Four.MP3", "/music/Gone"])
     }
 }
 
@@ -143,7 +168,7 @@ import Testing
     @Test func upgradingSeedsHistoryFromLastPlayed() throws {
         try store.db.execute("""
             DROP TABLE play_history; DROP TABLE tag_write_queue; DROP TABLE listen; DROP TABLE artist_link;
-            ALTER TABLE track DROP COLUMN musical_key;
+            DROP TABLE unreadable_file; ALTER TABLE track DROP COLUMN musical_key; ALTER TABLE track DROP COLUMN file_mtime;
             UPDATE track SET last_played = 500 WHERE title = 'Track 2';
             PRAGMA user_version = 1;
             """)

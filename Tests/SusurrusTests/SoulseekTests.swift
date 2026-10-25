@@ -74,6 +74,54 @@ import Testing
         #expect(throws: SlskError.self) { try frames.nextFrame() }
     }
 
+    /// Big shares' file lists (peer code 5) may run past the usual frame limit; nothing else may.
+    @Test func shareListsMayExceedTheFrameLimit() throws {
+        let length = UInt32(SlskFrameBuffer.maxFrameSize + 104)
+        var big = SlskWriter()
+        big.u32(length)
+        big.u32(SlskPeerCode.sharedFileListResponse.rawValue)
+        big.raw(Data(repeating: 0x42, count: Int(length) - 4))
+        var frames = SlskFrameBuffer()
+        frames.largeFrameCode = SlskPeerCode.sharedFileListResponse.rawValue
+        frames.append(big.data)
+        #expect(try frames.nextFrame()?.count == Int(length))
+
+        var other = SlskWriter()
+        other.u32(length)
+        other.u32(SlskPeerCode.userInfoResponse.rawValue)
+        var strict = SlskFrameBuffer()
+        strict.largeFrameCode = SlskPeerCode.sharedFileListResponse.rawValue
+        strict.append(other.data)
+        #expect(throws: SlskError.self) { try strict.nextFrame() }
+    }
+
+    @Test func manyFramesInOneChunkComeOutInOrder() throws {
+        var stream = SlskWriter()
+        for index in 0 ..< 1000 {
+            stream.u32(8)
+            stream.u32(UInt32(index))
+            stream.u32(UInt32(index * 2))
+        }
+        var frames = SlskFrameBuffer()
+        var seen: [UInt32] = []
+        for part in [stream.data.prefix(6001), stream.data.dropFirst(6001)] {
+            frames.append(part)
+            while let frame = try frames.nextFrame() {
+                var reader = SlskReader(frame)
+                seen.append(try reader.u32())
+            }
+        }
+        #expect(seen == (0 ..< 1000).map(UInt32.init))
+    }
+
+    @Test func zlibPrefixesStopEarly() throws {
+        let original = Data((0 ..< 200_000).map { UInt8(truncatingIfNeeded: $0 &* 13) })
+        let compressed = try SlskZlib.deflate(original)
+        #expect(try SlskZlib.inflatePrefix(compressed, count: 100) == original.prefix(100))
+        #expect(try SlskZlib.inflatePrefix(SlskZlib.deflate(Data("short".utf8)), count: 100) == Data("short".utf8))
+        #expect(throws: SlskError.self) { try SlskZlib.inflate(compressed, limit: 1000) }
+    }
+
     @Test func zlibRoundTrips() throws {
         let original = Data("the quick brown fox jumps over the lazy dog, twice over. ".utf8) + Data(repeating: 0x41, count: 10_000)
         let compressed = try SlskZlib.deflate(original)
@@ -343,9 +391,47 @@ import Testing
         #expect(SoulseekModel.sanitize("a/b:c") == "a-b-c")
         #expect(SoulseekModel.sanitize("...hidden") == "hidden")
         #expect(SoulseekModel.sanitize("") == "download")
+        // Control and text-direction characters can disguise a name.
+        #expect(SoulseekModel.sanitize("evil\u{202E}calf.exe") == "evilcalf.exe")
+        #expect(SoulseekModel.sanitize("a\u{0}b\nc\u{7F}") == "abc")
+        #expect(SoulseekModel.sanitize("\u{2066}.hidden") == "hidden")
+        // Long names are cut between characters, keeping the extension.
+        let long = SoulseekModel.sanitize(String(repeating: "é", count: 300) + ".flac")
+        #expect(long.utf8.count <= 240)
+        #expect(long.hasSuffix(".flac"))
 
         let flat = SoulseekModel.localDestination(for: "justafile.mp3", downloadsFolder: downloads)
         #expect(flat.path == "/tmp/Soulseek/justafile.mp3")
+    }
+
+    /// "CD1"/"Disc 2" folders stay inside their album folder, so the discs of an album land
+    /// together (and are tagged as one album).
+    @Test func discFoldersKeepTheirAlbumFolder() {
+        let downloads = URL(fileURLWithPath: "/tmp/Soulseek")
+        func destination(_ path: String) -> String {
+            SoulseekModel.localDestination(for: path, downloadsFolder: downloads).path
+        }
+        #expect(destination(#"@@u\Music\Great Album\CD1\01 Song.flac"#) == "/tmp/Soulseek/Great Album/CD1/01 Song.flac")
+        #expect(destination(#"@@u\Music\Great Album\Disc 2\01 Song.flac"#) == "/tmp/Soulseek/Great Album/Disc 2/01 Song.flac")
+        #expect(destination(#"@@u\Music\Great Album\disk3\01.flac"#) == "/tmp/Soulseek/Great Album/disk3/01.flac")
+        #expect(destination(#"CD1\01 Song.flac"#) == "/tmp/Soulseek/CD1/01 Song.flac")
+        #expect(destination(#"@@u\Music\Great Album\Scans\front.jpg"#) == "/tmp/Soulseek/Scans/front.jpg")
+        #expect(destination(#"@@u\Music\CD1 Remastered\01.flac"#) == "/tmp/Soulseek/CD1 Remastered/01.flac")
+    }
+
+    /// Each user's copy of a file collects in its own part file, in the hidden incomplete folder.
+    @Test func partFilesBelongToOneUserAndPath() {
+        let downloads = URL(fileURLWithPath: "/tmp/Soulseek")
+        let path = #"@@u\Music\Album\01 Song.flac"#
+        let mine = SoulseekModel.partialFileURL(username: "alice", remotePath: path, downloadsFolder: downloads)
+        #expect(mine != SoulseekModel.partialFileURL(username: "bob", remotePath: path, downloadsFolder: downloads))
+        #expect(mine != SoulseekModel.partialFileURL(username: "alice", remotePath: path + "x", downloadsFolder: downloads))
+        #expect(mine == SoulseekModel.partialFileURL(username: "alice", remotePath: path, downloadsFolder: downloads))
+        #expect(mine.deletingLastPathComponent().path == "/tmp/Soulseek/.incomplete")
+        #expect(mine.pathExtension == "part")
+        let long = #"@@u\"# + String(repeating: "ü", count: 400) + ".flac"
+        let part = SoulseekModel.partialFileURL(username: "alice", remotePath: long, downloadsFolder: downloads)
+        #expect(part.lastPathComponent.utf8.count <= 255)
     }
 
     @Test func qualityDescriptionsRead() {
@@ -363,6 +449,89 @@ import Testing
         result.isVBR = true
         #expect(result.qualityDescription == "MP3 245 VBR")
         #expect(result.availability == 0)
+    }
+}
+
+/// Sizes and names from other peers can be hostile; none of them may crash or escape.
+@Suite struct SlskHardeningTests {
+    @Test func implausibleFileSizesAreDropped() throws {
+        var body = SlskWriter()
+        body.string("uploader")
+        body.u32(77)
+        body.u32(3)
+        let files: [(String, UInt64)] = [
+            ("a.flac", 1000),
+            ("b.flac", UInt64(0xFFFF_FFFF) << 32 | 3_000_000_000),  // Soulseek NS: low half is the size
+            ("c.flac", 1 << 60),
+        ]
+        for (name, size) in files {
+            body.u8(1)
+            body.string(name)
+            body.u64(size)
+            body.string("")
+            body.u32(0)
+        }
+        body.bool(true)
+        body.u32(0)
+        body.u32(0)
+        let response = try SlskSearchResponse(parsing: try SlskZlib.deflate(body.data))
+        #expect(response.results.map(\.path) == ["a.flac", "b.flac"])
+        #expect(response.results.map(\.size) == [1000, 3_000_000_000])
+
+        var list = SlskWriter()
+        list.u32(1)
+        list.string("Music")
+        list.u32(2)
+        for (name, size) in [("ok.mp3", UInt64(10)), ("bad.mp3", 1 << 62)] {
+            list.u8(1)
+            list.string(name)
+            list.u64(size)
+            list.string("")
+            list.u32(0)
+        }
+        list.u32(0)
+        let shared = try SlskSharedFileList(parsing: try SlskZlib.deflate(list.data), username: "u")
+        #expect(shared.folders[0].files.map(\.path) == [#"Music\ok.mp3"#])
+
+        var transfer = SlskWriter()
+        transfer.u32(1)
+        transfer.u32(5)
+        transfer.string("x.flac")
+        transfer.u64(1 << 63)
+        #expect(try SlskTransferRequest(parsing: transfer.data).size == 0, "unknown: the search result's size stands")
+    }
+
+    @Test func hugeSizesDontTrapTheDisplay() {
+        func result(_ name: String) -> SlskSearchResult {
+            SlskSearchResult(
+                id: 0, username: "u", path: #"Music\Album\"# + name, size: .max, bitrate: nil, isVBR: false,
+                durationSeconds: nil, sampleRate: nil, bitDepth: nil, slotFree: true, averageSpeed: .max, queueLength: 0)
+        }
+        let rows = [result("a.flac"), result("b.flac")].map(ResultRow.init(file:))
+        let folder = ResultRow(folderPath: #"Music\Album"#, rows: rows)
+        #expect(folder.size == .max)
+        #expect(!folder.sizeText.isEmpty)
+        #expect(!rows[0].sizeText.isEmpty && !rows[0].speedText.isEmpty)
+        #expect(UInt64.max.saturatingAdd(1) == .max)
+    }
+
+    @Test func searchTokensAreReadWithoutInflatingEverything() throws {
+        var body = SlskWriter()
+        body.string("uploader")
+        body.u32(31_337)
+        body.u32(0)
+        body.raw(Data(repeating: 0, count: 1 << 20))
+        #expect(SlskSearchResponse.token(in: try SlskZlib.deflate(body.data)) == 31_337)
+        #expect(SlskSearchResponse.token(in: Data("not zlib at all".utf8)) == nil)
+    }
+
+    @Test func cantConnectToPeerMatchesTheSpec() throws {
+        var reader = SlskReader(SlskServerMessage.cantConnectToPeer(token: 0xBEEF, username: "someone"))
+        #expect(Int(try reader.u32()) == SlskServerMessage.cantConnectToPeer(token: 0xBEEF, username: "someone").count - 4)
+        #expect(try reader.u32() == 1001)
+        #expect(try reader.u32() == 0xBEEF)
+        #expect(try reader.string() == "someone")
+        #expect(reader.isAtEnd)
     }
 }
 
@@ -528,5 +697,17 @@ import Testing
         reloaded.remove("friend")
         SoulseekChats.flushWrites()
         #expect(SoulseekChats(fileURL: url).conversation(with: "friend") == nil)
+    }
+
+    @Test func oldReadConversationsGoBeyondTheCap() {
+        let chats = SoulseekChats(fileURL: nil)
+        chats.receive(message(1, from: "unread", "hi", at: 1), unread: true)
+        for index in 0 ..< 520 {
+            chats.receive(message(UInt32(index + 2), from: "user\(index)", "x", at: TimeInterval(10 + index)), unread: false)
+        }
+        #expect(chats.conversations.count == 500)
+        #expect(chats.conversation(with: "unread") != nil, "unread conversations stay")
+        #expect(chats.conversation(with: "user519") != nil)
+        #expect(chats.conversation(with: "user0") == nil)
     }
 }

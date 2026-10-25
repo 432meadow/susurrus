@@ -175,18 +175,23 @@ extension AppModel {
         lookup.cancel()
         releaseLookup = nil
         guard let match = lookup.selected else { return }
-        applyRelease(match, to: lookup.tracks, fields: lookup.fields, cover: lookup.includesCover ? lookup.cover : nil,
-                     isDownload: lookup.organizeRoot != nil, organizeRoot: lookup.organizes ? lookup.organizeRoot : nil)
+        Task {
+            await applyRelease(match, to: lookup.tracks, fields: lookup.fields, cover: lookup.includesCover ? lookup.cover : nil,
+                               isDownload: lookup.organizeRoot != nil, organizeRoot: lookup.organizes ? lookup.organizeRoot : nil)
+        }
     }
 
     /// Applies a release to the tracks: tags (undoable, like Get Info), then the cover. A download
     /// (files susurrus fetched itself) has its tags written into the files even with "Write tags
     /// to files" off, gets a cover.jpg, and can be moved into "Artist/Album (Year)" first.
+    /// Returns how many of the tracks (those still in the library) it was applied to.
+    @discardableResult
     func applyRelease(_ match: ReleaseMatcher.Match, to tracks: [Track], fields: ReleaseMatcher.Fields, cover: Data?,
-                      isDownload: Bool = false, organizeRoot: URL? = nil, registersUndo: Bool = true) {
+                      isDownload: Bool = false, organizeRoot: URL? = nil, registersUndo: Bool = true) async -> Int {
         let tracks = tracks.filter { tracksByID[$0.id] === $0 }
+        guard !tracks.isEmpty else { return 0 }
         if let organizeRoot {
-            organize(tracks, as: match, under: organizeRoot)
+            await organize(tracks, as: match, under: organizeRoot)
         }
         let edits = ReleaseMatcher.edits(for: match, inputs: tracks.map(ReleaseMatcher.Input.init), fields: fields)
         apply(tracks.compactMap { track in edits[track.id].map { ($0, [track]) } }, actionName: "Look Up Album",
@@ -200,6 +205,7 @@ extension AppModel {
         if let cover {
             setCover(cover, for: tracks, writeToFiles: writesTagsToFiles || isDownload, saveInFolder: isDownload)
         }
+        return tracks.count
     }
 
     /// The Cover Art Archive's front cover for a release, else its release group's.
@@ -241,40 +247,63 @@ extension AppModel {
 
     /// Moves the tracks into "Album Artist/Album (Year)" under `root`, renamed "03 Title.ext"
     /// after the release, and brings along the rest of their folders (cover, cue sheet, log) once
-    /// no audio is left there. Skipped while any of them is playing.
-    private func organize(_ tracks: [Track], as match: ReleaseMatcher.Match, under root: URL) {
+    /// no audio is left there. Skipped while any of them is playing. The moves run off the main
+    /// thread: the download folder can be on a slow share.
+    private func organize(_ tracks: [Track], as match: ReleaseMatcher.Match, under root: URL) async {
         guard !tracks.contains(where: { tagWriter.isInUse($0.path) }) else {
             EventLog.shared.log("Didn't move “\(match.release.title)”: a track is playing")
             return
         }
         let release = match.release
-        let fileManager = FileManager.default
-        var target = ReleaseMatcher.albumFolder(under: root, albumArtist: release.isVariousArtists ? "Various Artists" : release.artist,
+        let target = ReleaseMatcher.albumFolder(under: root, albumArtist: release.isVariousArtists ? "Various Artists" : release.artist,
                                                 album: release.title, year: release.year)
-        let sources = Set(tracks.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().standardizedFileURL })
-        if !sources.contains(target.standardizedFileURL) {
-            target = Self.unusedURL(target)
+        let files = tracks.map { track in
+            (id: track.id, path: track.path,
+             name: match.pairs[track.id].map { ReleaseMatcher.fileName(for: $0.slot, extension: (track.path as NSString).pathExtension) })
         }
+        let moves = await BlockingIO.library.run { Self.moveFiles(files, into: target, root: root) }
+        guard !moves.isEmpty else { return }
+        let saved: Void? = perform("Couldn't note where the files moved") { store in
+            try store.db.transaction {
+                for move in moves { try store.updatePath(move.path, bookmark: move.bookmark, forTrack: move.id) }
+            }
+        }
+        guard saved != nil else { return }
+        var moved: [String: URL] = [:]
+        for move in moves {
+            guard let track = tracksByID[move.id] else { continue }
+            moved[track.path] = URL(fileURLWithPath: move.path)
+            track.path = move.path
+        }
+        notePathsChanged()
+        noteTracksChanged()
+        soulseek.noteMoved(moved)
+    }
+
+    /// Moves the files into `target` (renamed where a name is given), then the rest of their
+    /// folders once no audio is left in them, and removes the folders that empties, up to `root`.
+    /// Returns where each file went, with a bookmark to it.
+    private nonisolated static func moveFiles(_ files: [(id: Int64, path: String, name: String?)], into target: URL,
+                                              root: URL) -> [(id: Int64, path: String, bookmark: Data?)] {
+        let fileManager = FileManager.default
+        let sources = Set(files.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().standardizedFileURL })
+        let target = sources.contains(target.standardizedFileURL) ? target : unusedURL(target)
         do {
             try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
         } catch {
             EventLog.shared.log("Couldn't create \(target.path): \(error.localizedDescription)")
-            return
+            return []
         }
 
-        var moves: [String: URL] = [:]
-        for track in tracks {
-            let old = URL(fileURLWithPath: track.path)
-            let name = match.pairs[track.id].map { ReleaseMatcher.fileName(for: $0.slot, extension: old.pathExtension) }
-                ?? old.lastPathComponent
-            var new = target.appendingPathComponent(name)
+        var moves: [(id: Int64, path: String, bookmark: Data?)] = []
+        for file in files {
+            let old = URL(fileURLWithPath: file.path)
+            var new = target.appendingPathComponent(file.name ?? old.lastPathComponent)
             guard new.standardizedFileURL != old.standardizedFileURL else { continue }
-            new = Self.unusedURL(new)
+            new = unusedURL(new)
             do {
                 try fileManager.moveItem(at: old, to: new)
-                try store?.updatePath(new.path, bookmark: try? new.bookmarkData(), forTrack: track.id)
-                moves[track.path] = new
-                track.path = new.path
+                moves.append((file.id, new.path, try? new.bookmarkData()))
             } catch {
                 EventLog.shared.log("Couldn't move \(old.lastPathComponent): \(error.localizedDescription)")
             }
@@ -288,13 +317,9 @@ extension AppModel {
                 let destination = target.appendingPathComponent(file.lastPathComponent)
                 if !fileManager.fileExists(atPath: destination.path) { try? fileManager.moveItem(at: file, to: destination) }
             }
-            Self.removeEmptyFolders(from: source, upTo: root)
+            removeEmptyFolders(from: source, upTo: root)
         }
-        if !moves.isEmpty {
-            notePathsChanged()
-            noteTracksChanged()
-            soulseek.noteMoved(moves)
-        }
+        return moves
     }
 
     /// `url`, or "name (2).ext", "name (3).ext"… if something is already there.
@@ -328,10 +353,10 @@ extension AppModel {
     /// After finished downloads are imported: matches each album folder to a MusicBrainz release and,
     /// when every file fits, fixes the tags, fetches the cover and (if set) moves it into place.
     /// Folders that don't match with certainty are left alone, with a notification.
-    func cleanUpDownloads(in folders: [URL]) {
+    func cleanUpDownloads(in folders: [URL], after scan: Task<ScanResult, Never>) {
         let albums = Set(folders.map(downloadAlbumFolder))
         Task { [weak self] in
-            await self?.scanTask?.value  // the import that was just started
+            _ = await scan.value  // the import of these folders
             for album in albums.sorted(by: { $0.path < $1.path }) {
                 await self?.cleanUpDownload(album)
             }
@@ -363,12 +388,16 @@ extension AppModel {
         }
         let cover = await Self.frontCover(for: best.release)
         let root = URL(fileURLWithPath: soulseek.downloadFolderPath)
-        applyRelease(best, to: tracks, fields: .all, cover: cover, isDownload: true,
-                     organizeRoot: soulseek.organizesDownloads ? root : nil, registersUndo: false)
+        let applied = await applyRelease(best, to: tracks, fields: .all, cover: cover, isDownload: true,
+                                         organizeRoot: soulseek.organizesDownloads ? root : nil, registersUndo: false)
+        guard applied > 0 else {
+            EventLog.shared.log("“\(folder.lastPathComponent)” matched on MusicBrainz, but its tracks left the library meanwhile")
+            return
+        }
         if soulseek.postsNotifications {
             let year = best.release.year.map { " (\($0))" } ?? ""
             Notifier.post(title: "Tagged “\(best.release.artist) – \(best.release.title)\(year)”",
-                          body: "\(tracks.count) \(tracks.count == 1 ? "file" : "files") matched on MusicBrainz\(cover == nil ? "" : ", with its cover").")
+                          body: "\(applied) \(applied == 1 ? "file" : "files") matched on MusicBrainz\(cover == nil ? "" : ", with its cover").")
         }
     }
 
@@ -389,13 +418,25 @@ extension AppModel {
 
     // MARK: Find Missing Covers
 
+    /// Find Missing Covers from the menus. With "Write tags to files" on, it first asks whether
+    /// the covers should go into the files too, since that rewrites every track of every album
+    /// that gets one (`pendingCoverSearch` drives the question).
+    func requestMissingCovers(for albums: [Album]) {
+        guard coverSearch == nil, !albums.isEmpty else { return }
+        if writesTagsToFiles {
+            pendingCoverSearch = albums
+        } else {
+            findMissingCovers(for: albums, writeToFiles: false)
+        }
+    }
+
     /// Looks up a cover for each album that has none (embedded, fetched, or an image in its folder)
-    /// by its release group on MusicBrainz, in the background. Covers go into the files too when
-    /// "Write tags to files" is on.
-    func findMissingCovers(for albums: [Album]) {
+    /// by its release group on MusicBrainz, in the background, and embeds what it finds in the
+    /// files when `writeToFiles`.
+    func findMissingCovers(for albums: [Album], writeToFiles: Bool) {
+        pendingCoverSearch = nil
         guard coverSearch == nil, !albums.isEmpty else { return }
         coverSearch = CoverSearch(total: albums.count)
-        coverSearchSummary = nil
         coverSearchTask = Task { [weak self] in
             var withoutCover = 0
             for album in albums {
@@ -403,7 +444,7 @@ extension AppModel {
                 if await !ArtworkStore.shared.hasArtwork(album.artworkRequest), !Task.isCancelled {
                     withoutCover += 1
                     if let data = await Self.findCover(for: album), !Task.isCancelled {
-                        self.setCover(data, for: album.tracks, writeToFiles: self.writesTagsToFiles)
+                        self.setCover(data, for: album.tracks, writeToFiles: writeToFiles)
                         self.coverSearch?.found += 1
                     }
                 }
@@ -413,11 +454,9 @@ extension AppModel {
             let found = self.coverSearch?.found ?? 0
             self.coverSearch = nil
             self.coverSearchTask = nil
-            self.coverSearchSummary = withoutCover == 0
+            self.notify(withoutCover == 0
                 ? "Every album has a cover"
-                : "Found \(found) of \(withoutCover) missing \(withoutCover == 1 ? "cover" : "covers")"
-            try? await Task.sleep(for: .seconds(20))
-            if self.coverSearch == nil { self.coverSearchSummary = nil }
+                : "Found \(found) of \(withoutCover) missing \(withoutCover == 1 ? "cover" : "covers")")
         }
     }
 

@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import Network
 import Testing
@@ -41,7 +42,7 @@ import Testing
                 #expect(token == 4242)
                 results = batch
                 continuation.finish()
-            case .disconnected(let reason):
+            case .disconnected(let reason, _):
                 Issue.record("unexpected disconnect: \(reason ?? "-")")
                 continuation.finish()
             default:
@@ -74,6 +75,72 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: request.partURL.path))
         #expect(mock.receivedOffset == 0)
         #expect(mock.failures.isEmpty)
+        // Marked as downloaded, like a browser's downloads.
+        let quarantine = try request.destinationURL.resourceValues(forKeys: [.quarantinePropertiesKey]).quarantineProperties
+        #expect(quarantine?[kLSQuarantineAgentNameKey as String] as? String == "susurrus")
+    }
+
+    /// A finished download never replaces a file already at its destination.
+    @Test func finishedDownloadsDontOverwriteExistingFiles() async throws {
+        let fileData = Data((0 ..< 30_000).map { UInt8(truncatingIfNeeded: $0 &* 3) })
+        let mock = try await MockSoulseekServer(peerBehavior: .upload(fileData))
+        defer { mock.stop() }
+        let folder = try makeTempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let request = downloadRequest(size: UInt64(fileData.count), in: folder)
+        try FileManager.default.createDirectory(at: request.destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("already here".utf8).write(to: request.destinationURL)
+
+        let finalState = try await runDownload(request, against: mock)
+
+        let landed = request.destinationURL.deletingLastPathComponent().appendingPathComponent("01 Song 2.flac")
+        #expect(finalState == .finished(landed))
+        #expect(try Data(contentsOf: landed) == fileData)
+        #expect(try Data(contentsOf: request.destinationURL) == Data("already here".utf8))
+    }
+
+    /// Two sources of the same file keep separate part files: another user's leftover bytes are
+    /// neither resumed nor touched.
+    @Test func doesNotResumeAnotherUsersPartFile() async throws {
+        let fileData = Data((0 ..< 50_000).map { UInt8(truncatingIfNeeded: $0 &* 29) })
+        let mock = try await MockSoulseekServer(peerBehavior: .upload(fileData))
+        defer { mock.stop() }
+        let folder = try makeTempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let request = downloadRequest(size: UInt64(fileData.count), in: folder)
+        let otherPart = SoulseekModel.partialFileURL(username: "someoneelse", remotePath: request.remotePath, downloadsFolder: folder)
+        #expect(otherPart != request.partURL)
+        try FileManager.default.createDirectory(at: otherPart.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let junk = Data(repeating: 0xEE, count: 20_000)
+        try junk.write(to: otherPart)
+
+        let finalState = try await runDownload(request, against: mock)
+
+        #expect(finalState == .finished(request.destinationURL))
+        #expect(mock.receivedOffset == 0)
+        #expect(try Data(contentsOf: request.destinationURL) == fileData)
+        #expect(try Data(contentsOf: otherPart) == junk)
+    }
+
+    /// A part file bigger than the file can't be this file's: the download starts over.
+    @Test func restartsWhenThePartFileIsTooLarge() async throws {
+        let fileData = Data((0 ..< 40_000).map { UInt8(truncatingIfNeeded: $0 &* 11) })
+        let mock = try await MockSoulseekServer(peerBehavior: .upload(fileData))
+        defer { mock.stop() }
+        let folder = try makeTempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let request = downloadRequest(size: UInt64(fileData.count), in: folder)
+        try FileManager.default.createDirectory(at: request.partURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 0xAB, count: 60_000).write(to: request.partURL)
+
+        let finalState = try await runDownload(request, against: mock)
+
+        #expect(finalState == .finished(request.destinationURL))
+        #expect(mock.receivedOffset == 0)
+        #expect(try Data(contentsOf: request.destinationURL) == fileData)
     }
 
     @Test func resumesFromAPartFile() async throws {
@@ -484,13 +551,199 @@ import Testing
         #expect(mock.failures.isEmpty)
     }
 
+    // MARK: Connections and deadlines
+
+    /// An incoming connection that never says who it is gets closed at the handshake deadline.
+    @Test func silentIncomingConnectionsCloseAtTheHandshakeDeadline() async throws {
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        var timeouts = SoulseekClient.Timeouts()
+        timeouts.handshake = 0.5
+        let (client, _, _) = makeClient(mock, timeouts: timeouts)
+        try await client.connect()
+        try await waitUntil { mock.clientListenPort != nil }
+
+        let silent = TCPConnection(host: "127.0.0.1", port: try #require(mock.clientListenPort))
+        defer { silent.cancel() }
+        try await silent.start(timeout: 5)
+        let start = ContinuousClock.now
+        _ = try? await silent.receive(timeout: 5)
+        let elapsed = ContinuousClock.now - start
+        await client.disconnect()
+
+        #expect(elapsed > .milliseconds(400) && elapsed < .seconds(2), "closed after \(elapsed)")
+    }
+
+    /// Disconnecting closes every connection, idle ones included.
+    @Test func disconnectingClosesIdleConnections() async throws {
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let (client, _, _) = makeClient(mock)
+        try await client.connect()
+        try await waitUntil { mock.clientListenPort != nil }
+        let idle = try await mock.openIdleConnection(as: "idler")
+        try await Task.sleep(for: .milliseconds(300))  // the client takes it in
+
+        let start = ContinuousClock.now
+        await client.disconnect()
+        _ = try? await idle.receive(timeout: 10)
+        let elapsed = ContinuousClock.now - start
+
+        #expect(elapsed < .seconds(2), "closed after \(elapsed)")
+    }
+
+    /// A firewalled peer pierces the client's listener moments after the relayed request; that
+    /// connection is used at once, while the direct dial is refused.
+    @Test func reachesFirewalledPeersThroughTheirPierce() async throws {
+        let mock = try await MockSoulseekServer()
+        mock.reachability = .firewalled
+        defer { mock.stop() }
+        let (client, _, _) = makeClient(mock)
+        try await client.connect()
+        try await waitUntil { mock.clientListenPort != nil }
+
+        let start = ContinuousClock.now
+        let info = try await client.userInfo(of: "mockpeer")
+        let elapsed = ContinuousClock.now - start
+        await client.disconnect()
+
+        #expect(info.description == "mock peer, sharing since forever")
+        #expect(elapsed < .seconds(3), "took \(elapsed)")
+        #expect(mock.failures.isEmpty)
+    }
+
+    @Test func downloadsFromFirewalledPeers() async throws {
+        let fileData = Data((0 ..< 70_000).map { UInt8(truncatingIfNeeded: $0 &* 23) })
+        let mock = try await MockSoulseekServer(peerBehavior: .upload(fileData))
+        mock.reachability = .firewalled
+        defer { mock.stop() }
+        let folder = try makeTempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let request = downloadRequest(size: UInt64(fileData.count), in: folder)
+        let start = ContinuousClock.now
+        let finalState = try await runDownload(request, against: mock)
+        let elapsed = ContinuousClock.now - start
+
+        #expect(finalState == .finished(request.destinationURL))
+        #expect(try Data(contentsOf: request.destinationURL) == fileData)
+        #expect(elapsed < .seconds(5), "took \(elapsed)")
+        #expect(mock.failures.isEmpty)
+    }
+
+    /// When the peer can't pierce either, the server says so (CantConnectToPeer) and the attempt
+    /// fails right away instead of at the pierce deadline.
+    @Test func cantConnectToPeerEndsTheAttemptEarly() async throws {
+        let mock = try await MockSoulseekServer()
+        mock.reachability = .unreachable
+        defer { mock.stop() }
+        let (client, _, _) = makeClient(mock)
+        try await client.connect()
+
+        let start = ContinuousClock.now
+        await #expect(throws: SlskError.self) { try await client.userInfo(of: "mockpeer") }
+        let elapsed = ContinuousClock.now - start
+        await client.disconnect()
+
+        #expect(elapsed < .seconds(3), "took \(elapsed)")
+    }
+
+    /// A login the server never answers fails at its deadline instead of hanging.
+    @Test func unansweredLoginsTimeOut() async throws {
+        let mock = try await MockSoulseekServer()
+        mock.answersLogin = false
+        defer { mock.stop() }
+        var timeouts = SoulseekClient.Timeouts()
+        timeouts.login = 1
+        let (client, _, _) = makeClient(mock, timeouts: timeouts)
+
+        let start = ContinuousClock.now
+        await #expect(throws: SlskError.self) { try await client.connect() }
+        let elapsed = ContinuousClock.now - start
+
+        #expect(elapsed > .milliseconds(900) && elapsed < .seconds(3), "took \(elapsed)")
+        #expect(await client.isLoggedIn == false)
+    }
+
+    /// The account logging in elsewhere ends the session for good: no reconnecting after it.
+    @Test func reloggedSessionsAreNotRetried() async throws {
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let (client, events, continuation) = makeClient(mock)
+        try await client.connect()
+        try await mock.sendRelogged()
+
+        var ended: (reason: String?, canReconnect: Bool)?
+        let deadline = finish(continuation, after: 10)
+        for await event in events {
+            if case .disconnected(let reason, let canReconnect) = event {
+                ended = (reason, canReconnect)
+                continuation.finish()
+            }
+        }
+        deadline.cancel()
+
+        let session = try #require(ended)
+        #expect(!session.canReconnect)
+        #expect(session.reason?.contains("somewhere else") == true)
+        #expect(await client.isLoggedIn == false)
+    }
+
+    /// Answers to searches the client isn't waiting for are dropped unread.
+    @Test func ignoresResultsForUnknownSearches() async throws {
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let (client, events, continuation) = makeClient(mock)
+        try await client.connect()
+        try await waitUntil { mock.clientListenPort != nil }
+        try await mock.sendSearchResult(token: 999)  // nobody searched for this
+        try await client.search(token: 4242, query: "test query")
+
+        var tokens: [UInt32] = []
+        let deadline = finish(continuation, after: 10)
+        for await event in events {
+            guard case .searchResults(let token, _) = event else { continue }
+            tokens.append(token)
+            if token == 4242 {
+                // Anything else would have come by now.
+                Task {
+                    try await Task.sleep(for: .milliseconds(500))
+                    continuation.finish()
+                }
+            }
+        }
+        deadline.cancel()
+        await client.disconnect()
+
+        #expect(tokens == [4242])
+    }
+
+    /// A share list that can't be read fails the browse at once, not at the browse deadline.
+    @Test func unreadableShareListsFailTheBrowseQuickly() async throws {
+        let mock = try await MockSoulseekServer(peerBehavior: .corruptShareList)
+        defer { mock.stop() }
+        let (client, _, _) = makeClient(mock)
+        try await client.connect()
+
+        let start = ContinuousClock.now
+        await #expect(throws: SlskError.self) { try await client.browse(user: "mockpeer") }
+        let elapsed = ContinuousClock.now - start
+        await client.disconnect()
+
+        #expect(elapsed < .seconds(3), "took \(elapsed)")
+    }
+
     // MARK: Helpers
 
-    private func makeClient(_ mock: MockSoulseekServer) -> (SoulseekClient, AsyncStream<SlskEvent>, AsyncStream<SlskEvent>.Continuation) {
+    private func makeClient(
+        _ mock: MockSoulseekServer, timeouts: SoulseekClient.Timeouts = .init()
+    ) -> (SoulseekClient, AsyncStream<SlskEvent>, AsyncStream<SlskEvent>.Continuation) {
         var eventContinuation: AsyncStream<SlskEvent>.Continuation!
         let events = AsyncStream<SlskEvent> { eventContinuation = $0 }
         let continuation = eventContinuation!
-        let client = SoulseekClient(username: "tester", password: "secret", server: (host: "127.0.0.1", port: mock.port)) {
+        let client = SoulseekClient(
+            username: "tester", password: "secret", server: (host: "127.0.0.1", port: mock.port), timeouts: timeouts
+        ) {
             continuation.yield($0)
         }
         return (client, events, continuation)
@@ -522,14 +775,17 @@ import Testing
         return url
     }
 
+    /// The request the model would make for mockpeer's `Album\01 Song.flac`.
     private func downloadRequest(size: UInt64, in folder: URL) -> SlskDownloadRequest {
-        let destination = folder.appendingPathComponent("Album/01 Song.flac")
+        let remotePath = #"@@mock\Artist\Album\01 Song.flac"#
+        let destination = SoulseekModel.localDestination(for: remotePath, downloadsFolder: folder)
+        #expect(destination == folder.appendingPathComponent("Album/01 Song.flac"))
         return SlskDownloadRequest(
             id: UUID(),
             username: "mockpeer",
-            remotePath: #"@@mock\Artist\Album\01 Song.flac"#,
+            remotePath: remotePath,
             size: size,
-            partURL: destination.appendingPathExtension("part"),
+            partURL: SoulseekModel.partialFileURL(username: "mockpeer", remotePath: remotePath, downloadsFolder: folder),
             destinationURL: destination
         )
     }
@@ -581,6 +837,17 @@ private final class MockSoulseekServer: @unchecked Sendable {
         case searchOnly
         case upload(Data)
         case deny(reason: String)
+        /// Answers a browse with bytes that aren't a share list.
+        case corruptShareList
+    }
+
+    /// How the client can reach "mockpeer": by dialing it, only through the peer piercing the
+    /// client's listener after a relayed ConnectToPeer (its own port refuses connections), or
+    /// not at all (the server answers ConnectToPeer with CantConnectToPeer).
+    enum Reachability {
+        case direct
+        case firewalled
+        case unreachable
     }
 
     let port: UInt16
@@ -589,10 +856,15 @@ private final class MockSoulseekServer: @unchecked Sendable {
     var requestUploadOnResult = false
     /// Delivered (as re-sent, not new) right after login, like messages that waited for us.
     var offlineMessages: [(id: UInt32, user: String, text: String)] = []
+    var reachability = Reachability.direct
+    /// False leaves the client's login unanswered.
+    var answersLogin = true
 
     private let listener: SlskListener
     private let peerListener: SlskListener
     private let peerPort: UInt16
+    /// A port nothing listens on, so dialing it is refused straight away.
+    private let closedPort: UInt16
     private let behavior: PeerBehavior
     private let lock = NSLock()
     private var _receivedQuery: String?
@@ -702,7 +974,7 @@ private final class MockSoulseekServer: @unchecked Sendable {
         return _failures
     }
 
-    private var clientListenPort: UInt16? {
+    var clientListenPort: UInt16? {
         lock.lock()
         defer { lock.unlock() }
         return _clientListenPort
@@ -752,9 +1024,12 @@ private final class MockSoulseekServer: @unchecked Sendable {
     init(peerBehavior: PeerBehavior = .searchOnly) async throws {
         behavior = peerBehavior
         guard let listener = SlskListener(preferredPort: 0),
-              let peerListener = SlskListener(preferredPort: 0) else {
+              let peerListener = SlskListener(preferredPort: 0),
+              let closed = SlskListener(preferredPort: 0) else {
             throw SlskError(message: "mock listener failed")
         }
+        closedPort = closed.port
+        closed.cancel()
         self.listener = listener
         self.peerListener = peerListener
         port = listener.port
@@ -833,6 +1108,7 @@ private final class MockSoulseekServer: @unchecked Sendable {
                 var reader = SlskReader(frame)
                 switch try reader.u32() {
                 case 1:  // Login
+                    guard answersLogin else { break }
                     var body = SlskWriter()
                     body.bool(true)
                     body.string("Welcome to the mock")
@@ -853,9 +1129,35 @@ private final class MockSoulseekServer: @unchecked Sendable {
                     var body = SlskWriter()
                     body.string(username)
                     body.u32(0x7F00_0001)  // 127.0.0.1
-                    body.u32(UInt32(peerPort))
+                    switch reachability {
+                    case .direct: body.u32(UInt32(peerPort))
+                    case .firewalled: body.u32(UInt32(closedPort))
+                    case .unreachable: body.u32(0)
+                    }
                     body.u32(1)
                     try await connection.send(serverFrame(code: 3, body: body))
+                case 18:  // ConnectToPeer from the client: token, user, type
+                    let token = try reader.u32()
+                    let username = try reader.string()
+                    let type = try reader.string()
+                    switch reachability {
+                    case .direct:
+                        break  // the client's direct dial gets through
+                    case .firewalled:
+                        guard type == "P" else { break }
+                        Task {
+                            do {
+                                try await self.pierce(token: token)
+                            } catch {
+                                self.recordFailure("pierce: \(error)")
+                            }
+                        }
+                    case .unreachable:
+                        var body = SlskWriter()
+                        body.u32(token)
+                        body.string(username)
+                        try await connection.send(serverFrame(code: 1001, body: body))
+                    }
                 case 5:  // WatchUser: exists, online, stats, country code
                     let username = try reader.string()
                     record { $0._watchedUsers.append(username) }
@@ -915,6 +1217,39 @@ private final class MockSoulseekServer: @unchecked Sendable {
         body.u32(56)
     }
 
+    /// Server code 41: someone logged in with the client's account elsewhere.
+    func sendRelogged() async throws {
+        guard let connection = serverConnection else { throw SlskError(message: "no server connection yet") }
+        try await connection.send(serverFrame(code: 41, body: SlskWriter()))
+    }
+
+    /// Answers a search the client may or may not have made, as "mockpeer".
+    func sendSearchResult(token: UInt32) async throws {
+        guard let port = clientListenPort, port != 0 else { throw SlskError(message: "client never sent SetWaitPort") }
+        try await sendResultAsPeer(to: port, token: token)
+    }
+
+    /// Dials the client's listener and says hello as `user`, then stays quiet.
+    func openIdleConnection(as user: String) async throws -> TCPConnection {
+        guard let port = clientListenPort, port != 0 else { throw SlskError(message: "client never sent SetWaitPort") }
+        let peer = TCPConnection(host: "127.0.0.1", port: port)
+        track(peer)
+        try await peer.start(timeout: 5)
+        try await peer.send(SlskPeerInit.peerInit(username: user, connectionType: "P"))
+        return peer
+    }
+
+    /// "mockpeer" behind a firewall: answers the relayed ConnectToPeer by dialing the client and
+    /// piercing with its token, then serves peer messages on that connection.
+    private func pierce(token: UInt32) async throws {
+        guard let port = clientListenPort, port != 0 else { throw SlskError(message: "client never sent SetWaitPort") }
+        let connection = TCPConnection(host: "127.0.0.1", port: port)
+        track(connection)
+        try await connection.start(timeout: 5)
+        try await connection.send(SlskPeerInit.pierceFirewall(token: token))
+        try await servePeer(connection, greeted: true)
+    }
+
     private func sendResultAsPeer(to port: UInt16, token: UInt32) async throws {
         let peer = TCPConnection(host: "127.0.0.1", port: port)
         track(peer)
@@ -954,9 +1289,10 @@ private final class MockSoulseekServer: @unchecked Sendable {
 
     private static let transferToken: UInt32 = 7777
 
-    private func servePeer(_ connection: SocketConnection) async throws {
+    /// `greeted` is true for a connection whose init is already done (one we pierced).
+    private func servePeer(_ connection: any SlskStream, greeted: Bool = false) async throws {
         var frames = SlskFrameBuffer()
-        var sawInit = false
+        var sawInit = greeted
         var initType = "P"
         while let chunk = try await connection.receive() {
             frames.append(chunk)
@@ -979,7 +1315,7 @@ private final class MockSoulseekServer: @unchecked Sendable {
                 case .queueUpload:
                     let path = try reader.string()
                     switch behavior {
-                    case .searchOnly:
+                    case .searchOnly, .corruptShareList:
                         break
                     case .deny(let reason):
                         var body = SlskWriter()
@@ -1016,6 +1352,10 @@ private final class MockSoulseekServer: @unchecked Sendable {
                         try await connection.send(peerFrame(code: .queueUpload, body: body))
                     }
                 case .sharedFileListRequest:
+                    if case .corruptShareList = behavior {
+                        try await connection.send(SlskPeerMessage.sharedFileListResponse(browsePayload: Data(repeating: 0x78, count: 64)))
+                        break
+                    }
                     // Browse: two folders, bare file names as real clients send them.
                     var list = SlskWriter()
                     list.u32(2)
@@ -1054,7 +1394,7 @@ private final class MockSoulseekServer: @unchecked Sendable {
 
     /// The downloader's side of the client's upload: read the raw token, answer with offset 0,
     /// then collect the file bytes.
-    private func receiveUpload(_ connection: SocketConnection, buffered: Data) async throws {
+    private func receiveUpload(_ connection: any SlskStream, buffered: Data) async throws {
         var raw = buffered
         while raw.count < 4 {
             guard let chunk = try await connection.receive() else {

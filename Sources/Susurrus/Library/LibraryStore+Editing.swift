@@ -22,73 +22,56 @@ struct TrackEdit: Hashable {
 
     var isEmpty: Bool { self == TrackEdit() }
 
+    /// Whether the edit can change which artists the library has (or their album counts).
+    var changesArtists: Bool { artist != nil || albumArtist != nil || album != nil }
+
+    /// Each field's column, its property here and on `Track`: the one list the rest goes by.
+    /// Immutable (closures over key paths), so safe to share.
+    private struct Field: @unchecked Sendable {
+        let column: String
+        let value: (TrackEdit) -> Any?
+        /// Sets the field in the edit to the track's current value.
+        let takeCurrent: (Track, inout TrackEdit) -> Void
+        /// Sets the track's value to the edit's, if the edit has one.
+        let apply: (TrackEdit, Track) -> Void
+
+        init<Value>(_ column: String, _ edit: WritableKeyPath<TrackEdit, Value?>, _ track: ReferenceWritableKeyPath<Track, Value>) {
+            self.column = column
+            value = { $0[keyPath: edit].map { $0 as Any } }
+            takeCurrent = { source, result in result[keyPath: edit] = source[keyPath: track] }
+            apply = { changes, target in
+                if let new = changes[keyPath: edit] { target[keyPath: track] = new }
+            }
+        }
+    }
+
+    private static let fields: [Field] = [
+        Field("title", \.title, \.title), Field("artist", \.artist, \.artist), Field("album", \.album, \.album),
+        Field("album_artist", \.albumArtist, \.albumArtist), Field("genre", \.genre, \.genre),
+        Field("composer", \.composer, \.composer), Field("grouping", \.grouping, \.grouping),
+        Field("comment", \.comment, \.comment), Field("year", \.year, \.year),
+        Field("track_number", \.trackNumber, \.trackNumber), Field("track_count", \.trackCount, \.totalNumberOfTracks),
+        Field("disc_number", \.discNumber, \.discNumber), Field("disc_count", \.discCount, \.totalNumberOfDiscs),
+        Field("bpm", \.bpm, \.bpm), Field("musical_key", \.musicalKey, \.musicalKey),
+        Field("compilation", \.compilation, \.compilation), Field("rating", \.rating, \.rating),
+    ]
+
     /// (column, value) pairs for the fields that are set.
     fileprivate var assignments: [(String, Any)] {
-        var result: [(String, Any)] = []
-        func add(_ column: String, _ value: Any?) { if let value { result.append((column, value)) } }
-        add("title", title)
-        add("artist", artist)
-        add("album", album)
-        add("album_artist", albumArtist)
-        add("genre", genre)
-        add("composer", composer)
-        add("grouping", grouping)
-        add("comment", comment)
-        add("year", year)
-        add("track_number", trackNumber)
-        add("track_count", trackCount)
-        add("disc_number", discNumber)
-        add("disc_count", discCount)
-        add("bpm", bpm)
-        add("musical_key", musicalKey)
-        add("compilation", compilation)
-        add("rating", rating)
-        return result
+        Self.fields.compactMap { field in field.value(self).map { (field.column, $0) } }
     }
 
     /// The track's current values for the fields this edit sets (what undoing it puts back).
     func currentValues(in track: Track) -> TrackEdit {
         var old = TrackEdit()
-        if title != nil { old.title = track.title }
-        if artist != nil { old.artist = track.artist }
-        if album != nil { old.album = track.album }
-        if albumArtist != nil { old.albumArtist = track.albumArtist }
-        if genre != nil { old.genre = track.genre }
-        if composer != nil { old.composer = track.composer }
-        if grouping != nil { old.grouping = track.grouping }
-        if comment != nil { old.comment = track.comment }
-        if year != nil { old.year = track.year }
-        if trackNumber != nil { old.trackNumber = track.trackNumber }
-        if trackCount != nil { old.trackCount = track.totalNumberOfTracks }
-        if discNumber != nil { old.discNumber = track.discNumber }
-        if discCount != nil { old.discCount = track.totalNumberOfDiscs }
-        if bpm != nil { old.bpm = track.bpm }
-        if musicalKey != nil { old.musicalKey = track.musicalKey }
-        if compilation != nil { old.compilation = track.compilation }
-        if rating != nil { old.rating = track.rating }
+        for field in Self.fields where field.value(self) != nil { field.takeCurrent(track, &old) }
         return old
     }
 
     /// Applies the set fields to an in-memory track so the UI updates without a reload.
     func apply(to track: Track) {
-        if let title { track.title = title }
-        if let artist { track.artist = artist }
-        if let album { track.album = album }
-        if let albumArtist { track.albumArtist = albumArtist }
-        if let genre { track.genre = genre }
-        if let composer { track.composer = composer }
-        if let grouping { track.grouping = grouping }
-        if let comment { track.comment = comment }
-        if let year { track.year = year }
-        if let trackNumber { track.trackNumber = trackNumber }
-        if let trackCount { track.totalNumberOfTracks = trackCount }
-        if let discNumber { track.discNumber = discNumber }
-        if let discCount { track.totalNumberOfDiscs = discCount }
-        if let bpm { track.bpm = bpm }
-        if let musicalKey { track.musicalKey = musicalKey }
-        if let compilation { track.compilation = compilation }
-        if let rating { track.rating = rating }
-        track.resetSearchText()
+        for field in Self.fields { field.apply(self, track) }
+        track.tagsDidChange()
     }
 }
 
@@ -178,10 +161,11 @@ extension LibraryStore {
 
     func appendTracks(_ trackIDs: [Int64], toPlaylist id: Int64) throws {
         try db.transaction {
-            let count = try db.prepare("SELECT COUNT(*) FROM playlist_track WHERE playlist_id = ?")
-            try count.bind([id])
-            try count.step()
-            try insertEntries(trackIDs, into: id, startingAt: Int(count.int(0) ?? 0))
+            // Positions can have gaps (removed tracks take their entries with them), so not COUNT(*).
+            let next = try db.prepare("SELECT COALESCE(MAX(position) + 1, 0) FROM playlist_track WHERE playlist_id = ?")
+            try next.bind([id])
+            try next.step()
+            try insertEntries(trackIDs, into: id, startingAt: Int(next.int(0) ?? 0))
         }
     }
 
@@ -216,41 +200,11 @@ extension LibraryStore {
 extension LibraryStore {
     // MARK: Adding files
 
-    /// Every path already in the library, to skip known files when scanning folders.
+    /// Every path already in the library.
     func allPaths() throws -> Set<String> {
         let statement = try db.prepare("SELECT path FROM track")
         var paths = Set<String>()
         while try statement.step() { if let path = statement.string(0) { paths.insert(path) } }
         return paths
-    }
-
-    /// Inserts scanned files; paths already in the library are skipped. Returns how many were added.
-    @discardableResult
-    func insert(_ scanned: [ScannedTrack], addedAt date: Date = Date()) throws -> Int {
-        var added = 0
-        try db.transaction {
-            let exists = try db.prepare("SELECT 1 FROM track WHERE path = ?")
-            let insert = try db.prepare("""
-                INSERT INTO track (title, artist, album, album_artist, genre, composer, comment, year,
-                    track_number, track_count, disc_number, disc_count, bpm, compilation, duration, bit_rate,
-                    sample_rate, channels, file_size, date_added, date_created, date_modified, path, bookmark,
-                    musical_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """)
-            for track in scanned {
-                try exists.bind([track.path])
-                if try exists.step() { continue }
-                try insert.run([
-                    track.title, track.artist, track.album, track.albumArtist, track.genre, track.composer,
-                    track.comment, track.year, track.trackNumber, track.trackCount, track.discNumber,
-                    track.discCount, track.bpm, track.compilation, track.duration, track.bitRate,
-                    track.sampleRate, track.channels, track.fileSize, date.timeIntervalSince1970,
-                    track.dateCreated?.timeIntervalSince1970, track.dateModified?.timeIntervalSince1970,
-                    track.path, track.bookmark, track.musicalKey,
-                ])
-                added += 1
-            }
-        }
-        return added
     }
 }

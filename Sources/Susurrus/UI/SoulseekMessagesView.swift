@@ -33,6 +33,8 @@ struct UserStatusDot: View {
             .fill(color)
             .frame(width: 7, height: 7)
             .help(Self.text(for: status))
+            // The colour alone doesn't say it.
+            .accessibilityLabel(Self.text(for: status))
     }
 
     private var color: Color {
@@ -59,6 +61,7 @@ struct UserStatusDot: View {
 /// conversation and a reply field on the right.
 struct MessagesPane: View {
     @Environment(AppModel.self) private var model
+    @State private var conversationToDelete: String?
 
     private var soulseek: SoulseekModel { model.soulseek }
 
@@ -83,8 +86,8 @@ struct MessagesPane: View {
                                 .contextMenu {
                                     SoulseekUserMenu(soulseek: soulseek, user: conversation.user)
                                     Divider()
-                                    Button("Delete Conversation", role: .destructive) {
-                                        soulseek.removeConversation(conversation.user)
+                                    Button("Delete Conversation…", role: .destructive) {
+                                        conversationToDelete = conversation.user
                                     }
                                 }
                         }
@@ -92,7 +95,9 @@ struct MessagesPane: View {
                     .frame(minWidth: 200, idealWidth: 240, maxWidth: 340)
                     Group {
                         if let user = soulseek.selectedConversation, let conversation = soulseek.chats.conversation(with: user) {
+                            // A fresh view per user: drafts and focus never carry over to someone else.
                             ConversationView(conversation: conversation)
+                                .id(user)
                         } else {
                             ContentUnavailableView("Choose a Conversation", systemImage: "bubble.left.and.bubble.right")
                         }
@@ -100,6 +105,16 @@ struct MessagesPane: View {
                     .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+        }
+        .alert(
+            "Delete the conversation with \(conversationToDelete ?? "")?",
+            isPresented: Binding(get: { conversationToDelete != nil }, set: { if !$0 { conversationToDelete = nil } }),
+            presenting: conversationToDelete
+        ) { user in
+            Button("Delete", role: .destructive) { soulseek.removeConversation(user) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Its messages are removed from this Mac. This can't be undone.")
         }
         .onAppear { soulseek.isShowingMessages = true }
         .onDisappear { soulseek.isShowingMessages = false }
@@ -180,7 +195,13 @@ private struct ConversationView: View {
             Divider()
             composer
         }
-        .onAppear { draftFocused = true }
+        .onAppear {
+            draft = soulseek.messageDrafts[user] ?? ""
+            draftFocused = true
+        }
+        .onChange(of: draft) { _, text in
+            soulseek.messageDrafts[user] = text.isEmpty ? nil : text
+        }
     }
 
     private var header: some View {

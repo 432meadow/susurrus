@@ -46,12 +46,13 @@ final class NowPlayingCenter {
             return
         }
         var info: [String: Any] = [
-            MPMediaItemPropertyTitle: track.title.isEmpty ? track.fileName : track.title,
+            MPMediaItemPropertyTitle: track.displayTitle,
             MPMediaItemPropertyArtist: track.displayArtist,
             MPMediaItemPropertyAlbumTitle: track.album,
             MPMediaItemPropertyPlaybackDuration: player.duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: player.currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: player.isPlaying ? 1.0 : 0.0,
+            // The widget runs its own clock from this, so it stands still until audio comes out.
+            MPNowPlayingInfoPropertyPlaybackRate: player.isPlaying && !player.isLoading ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
         ]
         if artworkTrackID == track.id, let artwork {

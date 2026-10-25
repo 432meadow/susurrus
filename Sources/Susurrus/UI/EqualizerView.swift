@@ -57,6 +57,8 @@ private struct BandSlider: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Slider(value: $value, in: Equalizer.gainRange)
+                .accessibilityLabel("\(label) hertz")
+                .accessibilityValue(String(format: "%+.0f decibels", value))
                 .frame(width: 140)
                 .rotationEffect(.degrees(-90))
                 .frame(width: 34, height: 140)

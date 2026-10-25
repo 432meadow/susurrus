@@ -5,6 +5,10 @@ import SwiftUI
 struct ReleaseLookupView: View {
     @Environment(AppModel.self) private var model
     @Bindable var lookup: ReleaseLookup
+    private enum SearchField { case artist, album }
+    /// While the artist or album is being typed, Return searches again instead of applying.
+    @FocusState private var searchField: SearchField?
+    private var isEditingSearch: Bool { searchField != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -29,7 +33,7 @@ struct ReleaseLookupView: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 Button("Apply") { model.applyLookup(lookup) }
-                    .keyboardShortcut(.defaultAction)
+                    .keyboardShortcut(isEditingSearch ? nil : .defaultAction)
                     .disabled(lookup.selected == nil || (lookup.fields.isEmpty && !coverWillApply && !lookup.organizes))
             }
         }
@@ -44,8 +48,11 @@ struct ReleaseLookupView: View {
         HStack {
             TextField("Artist", text: $lookup.artist)
                 .frame(maxWidth: 200)
+                .focused($searchField, equals: .artist)
             TextField("Album", text: $lookup.album)
-            Button("Search") { lookup.search() }
+                .focused($searchField, equals: .album)
+            Button("Search", action: searchAgain)
+                .keyboardShortcut(isEditingSearch ? .defaultAction : nil)
                 .disabled(lookup.album.trimmingCharacters(in: .whitespaces).isEmpty)
             Divider().frame(height: 18)
             TextField("MusicBrainz release link", text: $lookup.releaseLink)
@@ -55,6 +62,11 @@ struct ReleaseLookupView: View {
                 .disabled(lookup.releaseLink.isEmpty)
         }
         .textFieldStyle(.roundedBorder)
+    }
+
+    private func searchAgain() {
+        guard !lookup.album.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        lookup.search()
     }
 
     private var releaseList: some View {
@@ -71,7 +83,7 @@ struct ReleaseLookupView: View {
                 }
                 .overlay(alignment: .bottom) {
                     if case .failed(let message) = lookup.phase {
-                        Text(message).font(.caption).foregroundStyle(.red).padding(6)
+                        Text(message).font(.caption).foregroundStyle(Palette.error).padding(6)
                     } else if lookup.phase == .searching {
                         ProgressView().controlSize(.small).padding(6)
                     }
@@ -94,7 +106,7 @@ struct ReleaseLookupView: View {
                         Link("Open on MusicBrainz", destination: match.release.url).font(.caption)
                         Text(matchSummary(match))
                             .font(.caption)
-                            .foregroundStyle(match.isConfident ? .green : .orange)
+                            .foregroundStyle(match.isConfident ? Palette.success : Palette.ochre)
                     }
                     Spacer(minLength: 0)
                 }
@@ -126,6 +138,8 @@ struct ReleaseLookupView: View {
         let current: String
         let proposed: String
         let number: String
+        /// Disc and position, for sorting.
+        let order: [Int]
         let lengthNote: String
         let isGood: Bool
     }
@@ -135,15 +149,17 @@ struct ReleaseLookupView: View {
             let pair = match.pairs[input.id]
             let current = input.title.isEmpty ? input.fileName : input.title
             guard let pair else {
-                return Row(id: input.id, current: current, proposed: "Not on this release", number: "–", lengthNote: "", isGood: false)
+                return Row(id: input.id, current: current, proposed: "Not on this release", number: "–", order: [Int.max],
+                           lengthNote: "", isGood: false)
             }
             let slot = pair.slot
             let number = slot.discCount > 1 ? "\(slot.disc)-\(slot.position)" : "\(slot.position)"
             let note = pair.lengthDifference.map { $0 < 1 ? "✓" : String(format: "%+.0f s", (slot.length ?? 0) - input.length) } ?? "?"
-            return Row(id: input.id, current: current, proposed: slot.title, number: number, lengthNote: note,
-                       isGood: (pair.lengthDifference ?? 99) <= 5)
+            return Row(id: input.id, current: current, proposed: slot.title, number: number, order: [slot.disc, slot.position],
+                       lengthNote: note, isGood: (pair.lengthDifference ?? 99) <= 5)
         }
-        .sorted { ($0.number.count, $0.number) < ($1.number.count, $1.number) }
+        // Disc, then position, as numbers ("1-10" after "1-9", "2-1" after both); unmatched files last.
+        .sorted { $0.order.lexicographicallyPrecedes($1.order) }
     }
 
     private func trackTable(_ match: ReleaseMatcher.Match) -> some View {
@@ -152,10 +168,10 @@ struct ReleaseLookupView: View {
                 .width(36)
             TableColumn("File") { Text($0.current).foregroundStyle(.secondary) }
             TableColumn("On the Release") { row in
-                Text(row.proposed).foregroundStyle(row.number == "–" ? .orange : .primary)
+                Text(row.proposed).foregroundStyle(row.number == "–" ? Palette.ochre : .primary)
             }
             TableColumn("Length") { row in
-                Text(row.lengthNote).monospacedDigit().foregroundStyle(row.isGood ? Color.secondary : .orange)
+                Text(row.lengthNote).monospacedDigit().foregroundStyle(row.isGood ? Color.secondary : Palette.ochre)
             }
             .width(56)
         }
@@ -215,7 +231,7 @@ private struct ReleaseRow: View {
                 Text(match.release.title).fontWeight(.medium).lineLimit(1)
                 Spacer(minLength: 4)
                 if match.isConfident {
-                    Image(systemName: "checkmark.seal.fill").foregroundStyle(.green).help("Every file matches a track, lengths agree")
+                    Image(systemName: "checkmark.seal.fill").foregroundStyle(Palette.success).help("Every file matches a track, lengths agree")
                 } else {
                     Text("\(Int((match.score * 100).rounded()))%").font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }

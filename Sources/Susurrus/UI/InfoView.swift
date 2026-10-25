@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Get Info: edit tags for one or many tracks. With several tracks, fields that differ start
-/// empty ("Mixed") and only the fields you change are saved.
+/// empty ("Mixed") and only the fields you change are saved; a Mixed field you empty is cleared.
 struct InfoView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -45,8 +45,12 @@ struct InfoView: View {
     @State private var values: [Field: String] = [:]
     @State private var original: [Field: String] = [:]
     @State private var mixed: Set<Field> = []
+    @State private var edited: Set<Field> = []
     @State private var compilation: Bool?
     @State private var rating: Double = 0
+    /// Only a rating that was clicked is saved: with mixed ratings the stars start empty.
+    @State private var isRatingEdited = false
+    @State private var isRatingMixed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -77,7 +81,12 @@ struct InfoView: View {
                     get: { compilation ?? false },
                     set: { compilation = $0 }))
                 LabeledContent("Rating") {
-                    StarRatingPicker(rating: $rating)
+                    HStack(spacing: 8) {
+                        StarRatingPicker(rating: Binding(get: { rating }, set: { rating = $0; isRatingEdited = true }))
+                        if isRatingMixed, !isRatingEdited {
+                            Text("Mixed").foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             .formStyle(.columns)
@@ -115,11 +124,11 @@ struct InfoView: View {
             ArtworkView(request: tracks[0].artworkRequest, pixelSize: 200, cornerRadius: 6)
                 .frame(width: 80, height: 80)
             VStack(alignment: .leading, spacing: 3) {
-                Text(tracks.count == 1 ? (tracks[0].title.isEmpty ? tracks[0].fileName : tracks[0].title) : "\(tracks.count) tracks")
+                Text(tracks.count == 1 ? tracks[0].displayTitle : "\(tracks.count) tracks")
                     .font(.title3.weight(.semibold))
                     .lineLimit(2)
                 if tracks.count == 1 {
-                    Text([tracks[0].displayArtist, tracks[0].album].filter { !$0.isEmpty }.joined(separator: " — "))
+                    Text(tracks[0].artistAndAlbum)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -129,7 +138,13 @@ struct InfoView: View {
     private func textField(_ field: Field) -> some View {
         TextField(field.rawValue, text: Binding(
             get: { values[field] ?? "" },
-            set: { values[field] = $0 }),
+            set: {
+                // SwiftUI also writes the text back unchanged (when the field loses focus): that's
+                // no edit, and counting it would clear a Mixed field on every track.
+                guard $0 != (values[field] ?? "") else { return }
+                values[field] = $0
+                edited.insert(field)
+            }),
             prompt: Text(mixed.contains(field) ? "Mixed" : ""))
     }
 
@@ -164,14 +179,18 @@ struct InfoView: View {
         compilation = compilations.count == 1 ? compilations.first : nil
         let ratings = Set(tracks.map(\.rating))
         rating = ratings.count == 1 ? ratings.first! : 0
+        isRatingMixed = ratings.count > 1
     }
 
     private func save() {
         var edit = TrackEdit()
-        for field in Field.allCases where values[field] != original[field] {
+        // A Mixed field starts out empty, so emptying it (to clear it on every track) counts as a change.
+        for field in Field.allCases where edited.contains(field) && (values[field] != original[field] || mixed.contains(field)) {
             let text = (values[field] ?? "").trimmingCharacters(in: .whitespaces)
             if field.isNumeric {
-                let number = Int(text) ?? 0
+                // A BPM may be typed with decimals; anything that isn't a number leaves the field alone.
+                let parsed = field == .bpm ? Double(text).map { Int($0.rounded()) } : Int(text)
+                guard let number = text.isEmpty ? 0 : parsed else { continue }
                 switch field {
                 case .year: edit.year = number
                 case .trackNumber: edit.trackNumber = number
@@ -198,7 +217,7 @@ struct InfoView: View {
         }
         let originalCompilations = Set(tracks.map(\.compilation))
         if let compilation, originalCompilations != [compilation] { edit.compilation = compilation }
-        if Set(tracks.map(\.rating)) != [rating] { edit.rating = rating }
+        if isRatingEdited, Set(tracks.map(\.rating)) != [rating] { edit.rating = rating }
         model.update(edit, for: tracks)
     }
 }

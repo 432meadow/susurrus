@@ -22,24 +22,20 @@ extension AppModel {
 
     /// The MusicBrainz artist picked by hand for this artist, if any.
     func linkedMBID(for artist: ArtistIndex.Artist) -> String? {
-        try? store?.artistMBID(forKey: artist.id)
+        performQuietly("Couldn't read an artist link") { try $0.artistMBID(forKey: artist.id) } ?? nil
     }
 
     func setLinkedMBID(_ mbid: String?, for artist: ArtistIndex.Artist) {
-        try? store?.setArtistMBID(mbid, forKey: artist.id)
+        perform("Couldn't save the artist link") { try $0.setArtistMBID(mbid, forKey: artist.id) }
     }
 
-    /// Plays every track by the artist, album by album.
+    /// Plays every track by the artist, album by album, or in random order (without turning the
+    /// player's own Shuffle on, which would outlast this).
     func playArtist(_ artist: ArtistIndex.Artist, shuffled: Bool = false) {
         let albums = Album.group(artists.tracks(for: artist), sortedBy: .year).reversed()
         let ordered = albums.flatMap(\.tracks) + artists.tracks(for: artist).filter(\.album.isEmpty)
         guard !ordered.isEmpty else { return }
-        if shuffled {
-            player.setShuffle(true)
-            player.play(ordered, startingAt: Int.random(in: ordered.indices))
-        } else {
-            player.play(ordered, startingAt: 0)
-        }
+        player.play(shuffled ? ordered.shuffled() : ordered, startingAt: 0)
     }
 
     // MARK: Soulseek
@@ -71,13 +67,13 @@ extension AppModel {
     // MARK: Stats
 
     func listeningStats(for range: ListeningStats.Range) async -> ListeningStats {
-        guard let store else { return ListeningStats() }
+        guard store != nil else { return ListeningStats() }
         let now = Date()
         let calendar = Calendar.current
         let start = ListeningStats.loadStart(for: range, now: now, calendar: calendar)
-        let listens = (try? store.listens(since: start)) ?? []
-        let plays = (try? store.plays(since: start)) ?? []
-        let firstListen = try? store.firstListenDate()
+        let listens = performQuietly("Couldn't read the listening history") { try $0.listens(since: start) } ?? []
+        let plays = performQuietly("Couldn't read the listening history") { try $0.plays(since: start) } ?? []
+        let firstListen = performQuietly("Couldn't read the listening history") { try $0.firstListenDate() } ?? nil
         var info: [Int64: ListeningStats.TrackInfo] = [:]
         for id in Set(listens.map(\.trackID)).union(plays.map(\.trackID)) {
             if let track = tracksByID[id] { info[id] = ListeningStats.TrackInfo(track) }

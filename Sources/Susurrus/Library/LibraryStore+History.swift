@@ -33,27 +33,18 @@ extension LibraryStore {
 
     /// Tag writes that were still queued when susurrus last quit.
     func pendingTagWrites() throws -> [(path: String, values: TagValues)] {
-        let statement = try db.prepare("SELECT path, tag_values FROM tag_write_queue ORDER BY rowid")
-        let decoder = JSONDecoder()
-        var result: [(String, TagValues)] = []
-        while try statement.step() {
-            guard let path = statement.string(0), let json = statement.string(1),
-                  let values = try? decoder.decode(TagValues.self, from: Data(json.utf8)) else { continue }
-            result.append((path, values))
-        }
-        return result
+        try tagWriteBacklog.load()
     }
 
-    /// Saves (or, with nil, forgets) the write still waiting for `path`.
+    /// Saves (or, with nil, forgets) the write still waiting for `path`. Returns right away: the
+    /// saving is batched and done in the background (see `TagWriteBacklog`).
     func savePendingTagWrite(_ values: TagValues?, forPath path: String) throws {
-        if let values, let json = String(data: try JSONEncoder().encode(values), encoding: .utf8) {
-            try db.prepare("INSERT OR REPLACE INTO tag_write_queue (path, tag_values) VALUES (?, ?)").run([path, json])
-        } else {
-            try db.prepare("DELETE FROM tag_write_queue WHERE path = ?").run([path])
-        }
+        tagWriteBacklog.save(values, forPath: path)
     }
 
     func clearPendingTagWrites() throws {
-        try db.execute("DELETE FROM tag_write_queue")
+        try tagWriteBacklog.clear()
     }
+
+    private var tagWriteBacklog: TagWriteBacklog { TagWriteBacklog.forLibrary(at: url) }
 }

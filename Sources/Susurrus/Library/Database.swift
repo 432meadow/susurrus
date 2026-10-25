@@ -56,16 +56,27 @@ final class Database {
         return Statement(handle: statement, database: self)
     }
 
+    /// Runs `body` in a transaction. Nested calls become savepoints, so a change made of several
+    /// store calls that each use a transaction can still be saved all or nothing.
     func transaction(_ body: () throws -> Void) throws {
-        try execute("BEGIN IMMEDIATE")
+        let savepoint = transactionDepth > 0 ? "nested\(transactionDepth)" : nil
+        try execute(savepoint.map { "SAVEPOINT \($0)" } ?? "BEGIN IMMEDIATE")
+        transactionDepth += 1
+        defer { transactionDepth -= 1 }
         do {
             try body()
-            try execute("COMMIT")
+            try execute(savepoint.map { "RELEASE \($0)" } ?? "COMMIT")
         } catch {
-            try? execute("ROLLBACK")
+            if let savepoint {
+                try? execute("ROLLBACK TO \(savepoint)")
+                try? execute("RELEASE \(savepoint)")
+            } else {
+                try? execute("ROLLBACK")
+            }
             throw error
         }
     }
+    private var transactionDepth = 0
 
     func tableExists(_ name: String) throws -> Bool {
         let statement = try prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")

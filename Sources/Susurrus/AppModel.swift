@@ -41,23 +41,38 @@ final class AppModel {
     private(set) var visibleTracks: [Track] = []
     /// `visibleTracks` grouped into albums; only computed while the Albums view is showing.
     private(set) var albums: [Album] = []
-    var albumSort: Album.Sort = .artist { didSet { refreshVisible() } }
+    var albumSort: Album.Sort = .artist { didSet { refilter() } }
     var selectedAlbumID: Album.ID?
-    /// Rows selected in the track table. Menu commands (Get Info, Rate, Add to Playlist…) act on these.
+    /// Rows selected in the track table (or an album's track list). Menu commands (Get Info, Rate,
+    /// Add to Playlist…) act on these.
     var selectedTrackIDs = Set<Int64>()
 
-    /// Selected tracks in the order they appear in the list.
+    /// Selected tracks in the order they appear in the list. An album page in the Artists view
+    /// isn't the track list, so its selection is found by ID, in album order.
     var selectedTracks: [Track] {
-        visibleTracks.filter { selectedTrackIDs.contains($0.id) }
+        if selection == .artists {
+            return selectedTrackIDs.compactMap { tracksByID[$0] }
+                .sorted { ($0.discNumber, $0.trackNumber, $0.title) < ($1.discNumber, $1.trackNumber, $1.title) }
+        }
+        return visibleTracks.filter { selectedTrackIDs.contains($0.id) }
     }
     /// Problems loading the current selection (e.g. a smart playlist that can't be evaluated).
     private(set) var selectionError: String?
-    var fatalError: String? {
-        didSet { if let fatalError, fatalError != oldValue { EventLog.shared.log(fatalError) } }
+    /// Why the library couldn't be opened at all; shown instead of the track list.
+    private(set) var libraryError: String? {
+        didSet { if let libraryError { EventLog.shared.log(libraryError) } }
     }
+    /// Messages shown over the window without blocking it (AppModel+Notices.swift).
+    var notices: [Notice] = []
 
-    var selection: SidebarItem? = .allTracks { didSet { loadSelection() } }
-    var searchText = "" { didSet { refreshVisible() } }
+    var selection: SidebarItem? = .allTracks {
+        didSet {
+            // Menu commands act on the selection, so it mustn't outlive the list it was made in.
+            if selection != oldValue { selectedTrackIDs = [] }
+            loadSelection()
+        }
+    }
+    var searchText = "" { didSet { if searchText != oldValue { refilter() } } }
     var sortOrder: [KeyPathComparator<Track>] = AppModel.defaultSort { didSet { refreshVisible() } }
 
     let player = Player()
@@ -115,8 +130,8 @@ final class AppModel {
     var releaseLookup: ReleaseLookup?
     /// Find Missing Covers' progress while it runs.
     var coverSearch: CoverSearch?
-    /// What the last Find Missing Covers found, shown in the subtitle for a while.
-    var coverSearchSummary: String?
+    /// Albums waiting for an answer on whether found covers go into the files too.
+    var pendingCoverSearch: [Album]?
     @ObservationIgnored var coverSearchTask: Task<Void, Never>?
     /// Download folders already matched (or tried) this session, so each is cleaned up once.
     @ObservationIgnored var cleanedDownloadFolders = Set<String>()
@@ -142,18 +157,18 @@ final class AppModel {
         browserGenre = genre
         browserArtist = nil
         browserAlbum = nil
-        refreshVisible()
+        refilter()
     }
 
     func browse(artist: String?) {
         browserArtist = artist
         browserAlbum = nil
-        refreshVisible()
+        refilter()
     }
 
     func browse(album: String?) {
         browserAlbum = album
-        refreshVisible()
+        refilter()
     }
 
     /// Narrows `tracks` by the browser columns, filling each column from the level above it.
@@ -179,15 +194,22 @@ final class AppModel {
     enum ScanState: Equatable {
         case idle
         case running(done: Int, total: Int)
-        case finished(added: Int)
+        case finished(added: Int, updated: Int)
     }
 
     var scanState: ScanState = .idle
+    /// Scans waiting for the one that's running (AppModel+Scanning.swift).
+    var queuedScans = 0
     /// Folders rescanned for new music at launch, when a volume mounts, and every 30 minutes.
     var watchedFolders: [String] = UserDefaults.standard.stringArray(forKey: "library.watchedFolders") ?? [] {
         didSet { UserDefaults.standard.set(watchedFolders, forKey: "library.watchedFolders") }
     }
-    @ObservationIgnored var scanTask: Task<Void, Never>?
+    /// The last scan asked for; each one waits for the one before it.
+    @ObservationIgnored var lastScan: Task<ScanResult, Never>?
+    /// Bumped by Stop: scans asked for before then don't run (or stop where they are).
+    @ObservationIgnored var scanGeneration = 0
+    /// A rescan of the watched folders is waiting or running, so another isn't queued behind it.
+    @ObservationIgnored var isRescanQueued = false
 
     // MARK: Writing tags to files
 
@@ -214,6 +236,10 @@ final class AppModel {
     var smartPlaylistDraft: SmartPlaylistDraft?
     /// Whether the Up Next panel is open.
     var isShowingUpNext = false
+    /// The playlist whose name is being edited in the sidebar (a new one starts that way).
+    var renamingPlaylistID: Int64?
+    /// The main window, for bringing it back from the menu bar.
+    @ObservationIgnored weak var mainWindow: NSWindow?
     /// Whether the two-deck mixer sits above the now-playing bar.
     var isShowingMixer = UserDefaults.standard.bool(forKey: "mixer.isShowing") {
         didSet { UserDefaults.standard.set(isShowingMixer, forKey: "mixer.isShowing") }
@@ -240,11 +266,17 @@ final class AppModel {
     @ObservationIgnored private var pathIndex: [String: Track]?
     /// Selection contents in their natural order (playlist order, or library order).
     @ObservationIgnored private var selectionTracks: [Track] = []
+    /// `selectionTracks` in the current sort order: typing in the search field only narrows it.
+    @ObservationIgnored private var sortedSelection: [Track] = []
+    /// Copies of the tracks for work off the main actor (`detachedTracks()`), until a track changes.
+    @ObservationIgnored private var cachedSnapshots: [Track]?
     @ObservationIgnored private var predicateCache: [Int64: NSPredicate] = [:]
     @ObservationIgnored private var selectionLoad: Task<Void, Never>?
     /// Which playlist or built-in list `selectionTracks` holds, so reloading it keeps the user's column sort.
     @ObservationIgnored private var loadedItem: SidebarItem?
     @ObservationIgnored var missingFilesCheck: Task<Void, Never>?
+    /// A volume came or went while a check ran; check everything again once it's done.
+    @ObservationIgnored var needsMissingFilesCheck = false
     static let recentDays = 30
     static let historyLimit = 2000
     /// True while a playlist (usually a smart one) is being evaluated.
@@ -256,7 +288,7 @@ final class AppModel {
             store = try LibraryStore(url: libraryURL)
             try reload()
         } catch {
-            fatalError = "Couldn't open the library: \(error.localizedDescription)"
+            libraryError = "Couldn't open the library: \(error.localizedDescription)"
         }
         let info = Bundle.main.infoDictionary ?? [:]
         EventLog.shared.log("Launched susurrus \(info["CFBundleShortVersionString"] as? String ?? "(development build)")", level: .info)
@@ -265,25 +297,25 @@ final class AppModel {
         player.onListenEnded = { [weak self] track, listen in self?.recordListen(listen, of: track) }
         connectMixer()
         soulseek.importFolders = { [weak self] folders in
-            guard let self, !self.isScanning, self.store != nil else { return false }
-            self.addToLibrary(folders)
-            if self.soulseek.tagsDownloads { self.cleanUpDownloads(in: folders) }
+            guard let self, self.store != nil else { return false }
+            let scan = self.addToLibrary(folders)
+            if self.soulseek.tagsDownloads { self.cleanUpDownloads(in: folders, after: scan) }
             return true
         }
-        // Shared files that are in the library advertise bitrate/duration/depth in search results.
-        soulseek.libraryAttributes = { [weak self] in
-            guard let self else { return [:] }
-            var known: [String: SlskFileAttributes] = [:]
-            known.reserveCapacity(self.tracks.count)
-            for track in self.tracks {
-                known[track.path] = SlskFileAttributes(
-                    bitrate: track.bitRate > 0 ? track.bitRate : nil,
-                    durationSeconds: track.length > 0 ? Int(track.length) : nil,
-                    sampleRate: track.sampleRate > 0 ? track.sampleRate : nil,
-                    bitDepth: track.bitDepth > 0 ? track.bitDepth : nil
-                )
+        // The share is built from the library's tracks (no walk of the share needed), and they
+        // advertise their bitrate, length and depth in search results.
+        soulseek.libraryFiles = { [weak self] in
+            guard let self else { return [] }
+            return self.tracks.map { track in
+                SlskLibraryFile(
+                    path: track.path,
+                    size: UInt64(max(0, track.fileSize)),
+                    attributes: SlskFileAttributes(
+                        bitrate: track.bitRate > 0 ? track.bitRate : nil,
+                        durationSeconds: track.length > 0 ? Int(track.length) : nil,
+                        sampleRate: track.sampleRate > 0 ? track.sampleRate : nil,
+                        bitDepth: track.bitDepth > 0 ? track.bitDepth : nil))
             }
-            return known
         }
         // Don't swap a file out from under the player.
         tagWriter.isInUse = { [weak self] path in
@@ -309,13 +341,15 @@ final class AppModel {
         }
 
         // Covers that failed while the music share was unmounted are worth retrying once it's back;
-        // so are files that looked missing.
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in
+        // so are files that looked missing. Only the volume that came or went is checked.
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] notification in
             ArtworkStore.shared.forgetMisses()
-            MainActor.assumeIsolated { self?.checkForMissingFiles() }
+            let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            MainActor.assumeIsolated { self?.checkForMissingFiles(onVolume: volume) }
         }
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkForMissingFiles() }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] notification in
+            let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            MainActor.assumeIsolated { self?.checkForMissingFiles(onVolume: volume) }
         }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(60))  // after launch has settled and the share has had time to mount
@@ -337,13 +371,30 @@ final class AppModel {
 
     // MARK: Library
 
+    /// Re-reads the whole library. Tracks already loaded keep their objects (the player, the
+    /// mixer, open sheets and undo steps hold on to them) and just take the stored values.
     func reload() throws {
         guard let store else { return }
-        tracks = try store.loadTracks()
-        tracksByID = Dictionary(uniqueKeysWithValues: tracks.map { ($0.id, $0) })
-        for (id, count) in try store.skipCounts() { tracksByID[id]?.skipCount = count }
+        let loaded = try store.loadTracks()
+        let skips = try store.skipCounts()
+        var byID: [Int64: Track] = [:]
+        byID.reserveCapacity(loaded.count)
+        tracks = loaded.map { fresh in
+            let track: Track
+            if let existing = tracksByID[fresh.id] {
+                existing.update(from: fresh)
+                track = existing
+            } else {
+                track = fresh
+            }
+            track.skipCount = skips[fresh.id] ?? 0
+            byID[track.id] = track
+            return track
+        }
+        tracksByID = byID
         artistIndex = nil
         pathIndex = nil
+        cachedSnapshots = nil
         playlists = try store.loadPlaylists()
         predicateCache = [:]
         if case .playlist(let id) = selection, playlistsByID[id] == nil {
@@ -371,6 +422,9 @@ final class AppModel {
             loadedItem = nil
             selectionTracks = []
             refreshVisible()
+        case .playlist(let id) where playlistsByID[id]?.kind == .regular:
+            // A database read: quick enough to show at once, without a flash of the old list.
+            showInOwnOrder(.playlist(id), regularPlaylistTracks(id))
         case .playlist(let id):
             loadInOwnOrder(.playlist(id)) { model in await model.tracks(inPlaylist: id) }
         case .recentlyAdded, .recentlyPlayed, .history, .duplicates, .missing:
@@ -380,10 +434,13 @@ final class AppModel {
     }
 
     /// Playlists and built-in lists open in their own order until a column header is clicked;
-    /// reloading the one already showing keeps the user's sort.
+    /// reloading the one already showing keeps the user's sort (and its rows while it loads). A
+    /// list that's new stays empty, with a spinner, until it's ready.
     private func loadInOwnOrder(_ item: SidebarItem, load: @escaping (AppModel) async -> [Track]) {
-        let keepSort = selectionTracks.isEmpty == false && loadedItem == item
-        if !keepSort { applySort([]) }
+        if loadedItem != item {
+            selectionTracks = []
+            applySort([])
+        }
         isLoadingSelection = true
         selectionLoad = Task { [weak self] in
             guard let self else { return }
@@ -396,6 +453,18 @@ final class AppModel {
         }
     }
 
+    private func showInOwnOrder(_ item: SidebarItem, _ tracks: [Track]) {
+        isLoadingSelection = false
+        let keepSort = loadedItem == item
+        loadedItem = item
+        selectionTracks = tracks
+        if keepSort { refreshVisible() } else { applySort([]) }
+    }
+
+    private func regularPlaylistTracks(_ id: Int64) -> [Track] {
+        (perform("Couldn't load the playlist") { try $0.trackIDs(inPlaylist: id) } ?? []).compactMap { tracksByID[$0] }
+    }
+
     private func builtInListTracks(_ item: SidebarItem) async -> [Track] {
         let cutoff = Date().addingTimeInterval(-Double(Self.recentDays) * 86_400)
         switch item {
@@ -406,10 +475,12 @@ final class AppModel {
             return tracks.filter { ($0.lastPlayed ?? .distantPast) >= cutoff }
                 .sorted { $0.lastPlayedSortKey > $1.lastPlayedSortKey }
         case .history:
-            return ((try? store?.historyTrackIDs(limit: Self.historyLimit)) ?? []).compactMap { tracksByID[$0] }
+            return (perform("Couldn't load the history") { try $0.historyTrackIDs(limit: Self.historyLimit) } ?? [])
+                .compactMap { tracksByID[$0] }
         case .duplicates:
-            let all = tracks
-            return await Task.detached(priority: .userInitiated) { Duplicates.find(in: all) }.value
+            let all = detachedTracks()
+            let found = await Task.detached(priority: .userInitiated) { Duplicates.find(in: all).map(\.id) }.value
+            return found.compactMap { tracksByID[$0] }
         case .missing:
             return tracks.filter { unavailableTracks[$0.id] == .missing }
         default:
@@ -437,10 +508,11 @@ final class AppModel {
                 return try store.trackIDs(inPlaylist: id).compactMap { tracksByID[$0] }
             case .smart:
                 let predicate = try predicate(for: id)
-                let all = tracks
-                return try await Task.detached(priority: .userInitiated) {
-                    try SmartPredicate.evaluate(predicate, on: all)
+                let all = detachedTracks()
+                let ids = try await Task.detached(priority: .userInitiated) {
+                    try SmartPredicate.evaluate(predicate, on: all).map(\.id)
                 }.value
+                return ids.compactMap { tracksByID[$0] }
             case .folder:
                 // A folder shows everything in its playlists, once each.
                 var seen = Set<Int64>()
@@ -483,17 +555,47 @@ final class AppModel {
 
     func noteTracksChanged() {
         libraryRevision += 1
+        cachedSnapshots = nil
     }
 
     /// Call after track paths change, so drops and lookups by path see the new ones.
     func notePathsChanged() {
         pathIndex = nil
+        cachedSnapshots = nil
+    }
+
+    /// Copies of every track for work done off the main actor, which mustn't read the live
+    /// objects while they may be edited. Reused until a track changes.
+    func detachedTracks() -> [Track] {
+        if let cachedSnapshots { return cachedSnapshots }
+        let copies = tracks.map { $0.snapshot() }
+        cachedSnapshots = copies
+        return copies
+    }
+
+    /// Brings tracks just added to the database (or changed in it) into memory. Tracks already
+    /// loaded keep their objects and take the stored values.
+    func refreshTracks(_ ids: [Int64]) {
+        guard !ids.isEmpty, let loaded = perform("Couldn't load the library", { try $0.loadTracks(ids: ids) }) else { return }
+        for fresh in loaded {
+            if let existing = tracksByID[fresh.id] {
+                existing.update(from: fresh)
+            } else {
+                tracks.append(fresh)
+                tracksByID[fresh.id] = fresh
+            }
+        }
+        artistIndex = nil
+        pathIndex = nil
+        noteTracksChanged()
+        loadSelection()
     }
 
     /// Drops tracks deleted from the database from everything in memory.
     func forgetTracks(_ ids: Set<Int64>) {
         guard !ids.isEmpty else { return }
         tracks.removeAll { ids.contains($0.id) }
+        cachedSnapshots = nil
         artistIndex = nil
         for id in ids {
             tracksByID[id] = nil
@@ -504,8 +606,16 @@ final class AppModel {
         loadSelection()
     }
 
+    /// Sorts the selection again and refilters it (after its tracks or their values changed).
     func refreshVisible() {
-        var result = selectionTracks
+        sortedSelection = sortOrder.isEmpty ? selectionTracks : TrackSort.sorted(selectionTracks, by: sortOrder)
+        refilter()
+    }
+
+    /// Narrows the sorted selection by the search and the column browser; filtering keeps the
+    /// order, so typing never re-sorts 50k tracks.
+    private func refilter() {
+        var result = sortedSelection
         // Every word must match somewhere, so "aphex ambient" works; scopes like bpm:120-128 too.
         let query = SearchQuery(searchText)
         if !query.isEmpty {
@@ -514,9 +624,6 @@ final class AppModel {
         }
         if selection == .browser {
             result = applyBrowser(to: result)
-        }
-        if !sortOrder.isEmpty {
-            result = TrackSort.sorted(result, by: sortOrder)
         }
         visibleTracks = result
         albums = selection == .albums ? Album.group(result, sortedBy: albumSort) : []

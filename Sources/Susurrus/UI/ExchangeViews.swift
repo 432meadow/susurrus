@@ -1,7 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// The Rekordbox export sheet, and dropping playlists, library exports and music on the window.
+/// The Rekordbox export and Library.xml import sheets, and dropping playlists, library exports and
+/// music on the window.
 struct ExchangeSheets: ViewModifier {
     @Environment(AppModel.self) private var model
 
@@ -10,6 +11,9 @@ struct ExchangeSheets: ViewModifier {
         content
             .sheet(item: $exchange.rekordboxDraft) { draft in
                 RekordboxExportSheet(draft: draft)
+            }
+            .sheet(item: $exchange.libraryImport) { pending in
+                LibraryImportSheet(pending: pending)
             }
             .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                 model.handleWindowDrop(providers)
@@ -70,5 +74,34 @@ struct RekordboxExportSheet: View {
     private func chosen(_ id: Int64) -> Binding<Bool> {
         Binding(get: { draft.chosen.contains(id) },
                 set: { if $0 { draft.chosen.insert(id) } else { draft.chosen.remove(id) } })
+    }
+}
+
+/// What importing a Library.xml would change, before anything does.
+struct LibraryImportSheet: View {
+    @Environment(AppModel.self) private var model
+    let pending: PendingLibraryImport
+    @State private var addsFiles = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Import “\(pending.fileName)”?").font(.headline)
+            Text(AppModel.importSummary(of: pending.plan).joined(separator: "\n"))
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if !pending.plan.addablePaths.isEmpty {
+                Toggle("Add the \(AppModel.count(pending.plan.addablePaths.count, "file", "files")) that aren't in the library (reads their tags)",
+                       isOn: $addsFiles)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { model.exchange.libraryImport = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("Import") { model.confirmLibraryImport(addFiles: addsFiles) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
     }
 }

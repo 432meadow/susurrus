@@ -42,7 +42,7 @@ struct ListeningStats: Sendable {
         }
 
         init(_ track: Track) {
-            self.init(title: track.title, artist: track.displayArtist, album: track.album,
+            self.init(title: track.displayTitle, artist: track.displayArtist, album: track.album,
                       albumArtist: track.albumGroupArtist, length: track.length)
         }
     }
@@ -199,7 +199,8 @@ struct ListeningStats: Sendable {
                 add(to: &artists, key: ArtistIndex.key(for: info.artist), title: info.artist, subtitle: "")
             }
             if !info.album.isEmpty {
-                add(to: &albums, key: ArtistIndex.key(for: info.albumArtist) + "\u{1}" + ArtistIndex.key(for: info.album),
+                // The same album identity as the Albums grid (`Track.albumKey`).
+                add(to: &albums, key: ArtworkStore.indexKey(artist: info.albumArtist, album: info.album),
                     title: info.album, subtitle: info.albumArtist)
             }
         }

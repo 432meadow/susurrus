@@ -59,7 +59,7 @@ private struct QueueRow: View {
             ArtworkView(request: track.artworkRequest, pixelSize: 64, cornerRadius: 3)
                 .frame(width: 32, height: 32)
             VStack(alignment: .leading, spacing: 1) {
-                Text(track.title.isEmpty ? track.fileName : track.title)
+                Text(track.displayTitle)
                     .fontWeight(isCurrent ? .semibold : .regular)
                     .lineLimit(1)
                 Text(track.displayArtist).font(.caption).foregroundStyle(.secondary).lineLimit(1)

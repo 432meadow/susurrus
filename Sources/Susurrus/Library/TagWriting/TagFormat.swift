@@ -9,6 +9,8 @@ enum TagWriteError: LocalizedError, Equatable {
     case verificationFailed(String)
     case modifiedSinceRead
     case fileMissing
+    /// Writing the tags in place stopped partway, and the old bytes couldn't be put back either.
+    case partlyWritten
 
     var errorDescription: String? {
         switch self {
@@ -18,6 +20,7 @@ enum TagWriteError: LocalizedError, Equatable {
         case .verificationFailed(let what): "The rewritten copy didn't check out (\(what)); the original was left alone"
         case .modifiedSinceRead: "The file changed while susurrus was writing it; skipped"
         case .fileMissing: "The file isn't there (is the share mounted?)"
+        case .partlyWritten: "Writing the tags stopped partway and the old ones couldn't be put back; check the file"
         }
     }
 }

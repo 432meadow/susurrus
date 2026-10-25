@@ -42,7 +42,9 @@ final class Track: NSObject, Identifiable {
     @objc var lastPlayed: Date?
     @objc var dateModified: Date?
     @objc var dateCreated: Date?
-    @objc var path = ""
+    @objc var path = "" {
+        didSet { sortKeys.removeAll() }
+    }
 
     init(id: Int64) {
         self.id = id
@@ -53,18 +55,49 @@ final class Track: NSObject, Identifiable {
     @objc var kind: String { fileType }
 
     var displayArtist: String { artist.isEmpty ? albumArtist : artist }
+    /// The title, or the file name for an untitled track.
+    var displayTitle: String { title.isEmpty ? fileName : title }
+    /// "Artist — Album", leaving out whichever is empty.
+    var artistAndAlbum: String { [displayArtist, album].filter { !$0.isEmpty }.joined(separator: " — ") }
 
-    /// Lowercased haystack for the search field.
+    /// Haystack for the search field, folded like everything else (`TextKey`).
     var searchText: String {
         if let cachedSearchText { return cachedSearchText }
-        let text = [title, artist, album, albumArtist, genre, composer].joined(separator: "\u{1}").lowercased()
+        let text = TextKey.folded([title, artist, album, albumArtist, genre, composer].joined(separator: "\u{1}"))
         cachedSearchText = text
         return text
     }
     private var cachedSearchText: String?
 
-    /// Call after editing tags so search sees the new values.
-    func resetSearchText() { cachedSearchText = nil }
+    /// A text column's folded sort key, kept until the track's tags change (sorting 50k tracks
+    /// by a text column otherwise folds every value again on each sort).
+    func sortKey(_ keyPath: KeyPath<Track, String>) -> NSString {
+        if let key = sortKeys[keyPath] { return key }
+        let key = TextKey.folded(self[keyPath: keyPath]) as NSString
+        sortKeys[keyPath] = key
+        return key
+    }
+    private var sortKeys: [AnyKeyPath: NSString] = [:]
+
+    /// Call after editing tags so search and sorting see the new values.
+    func tagsDidChange() {
+        cachedSearchText = nil
+        sortKeys.removeAll()
+    }
+
+    /// Takes every stored value of `other` (the same track, freshly loaded), keeping this object.
+    func update(from other: Track) {
+        for column in Track.columns { column.copy(other, self) }
+        tagsDidChange()
+    }
+
+    /// A copy for work off the main actor, which mustn't read tracks the main actor may be editing.
+    func snapshot() -> Track {
+        let copy = Track(id: id)
+        for column in Track.columns { column.copy(self, copy) }
+        copy.skipCount = skipCount
+        return copy
+    }
 
     // Comparable stand-ins for optional values, used by table sorting.
     var dateAddedSortKey: Double { dateAdded?.timeIntervalSinceReferenceDate ?? 0 }

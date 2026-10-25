@@ -137,6 +137,51 @@ import Testing
         try expectNoTempFiles()
     }
 
+    /// Byte ranges of each frame in an ID3 tag without an extended header.
+    private func frameRanges(_ bytes: [UInt8]) throws -> [(id: String, range: Range<Int>)] {
+        var start = 10
+        return try ID3Tag.parse(bytes).frames.map { frame in
+            defer { start += frame.raw.count }
+            return (frame.id, start..<start + frame.raw.count)
+        }
+    }
+
+    @Test func mp3TitleEditsBesideALargeCoverStaySmall() async throws {
+        let cover = MP3Fixture.frame("APIC", [0] + Array("image/jpeg".utf8) + [0, 3, 0] + LargeCover.bytes)
+        let url = try file("covered.mp3", MP3Fixture.id3(version: 3, frames: [
+            MP3Fixture.text("TIT2", "Old title"), MP3Fixture.text("TPE1", "Artist"), cover,
+        ], padding: 1024) + MP3Fixture.audio())
+        let node = inode(url)
+
+        // The first edit moves the title past the cover: too much to patch, so it's a verified copy.
+        _ = try await TagFileWriter.write(TagValues(title: "A longer new title"), to: url)
+        #expect(inode(url) != node, "replaced by a verified copy")
+        let moved = try bytes(url)
+        #expect(try frameRanges(moved).map(\.id) == ["TPE1", "APIC", "TIT2"])
+        let coverRange = try #require(try frameRanges(moved).first { $0.id == "APIC" }).range
+        #expect(Array(moved[coverRange]) == cover)
+        #expect(Array(moved[try ID3Tag.parse(moved).end...]) == MP3Fixture.audio())
+
+        // From then on, editing the title rewrites only the title.
+        let node2 = inode(url)
+        _ = try await TagFileWriter.write(TagValues(title: "Newer"), to: url)
+        let retitled = try bytes(url)
+        #expect(inode(url) == node2, "patched in place")
+        let ranges = TagFileWriter.changedRanges(from: moved, to: retitled)
+        #expect(ranges.reduce(0) { $0 + $1.count } < 100)
+        #expect(ranges.allSatisfy { !$0.overlaps(coverRange) })
+        #expect(try ID3Tag.read(retitled).title == "Newer")
+
+        // A frame that keeps its size keeps its place, even before the cover.
+        _ = try await TagFileWriter.write(TagValues(artist: "Artisx"), to: url)
+        let renamed = try bytes(url)
+        #expect(inode(url) == node2)
+        #expect(TagFileWriter.changedRanges(from: retitled, to: renamed).reduce(0) { $0 + $1.count } == 1)
+        #expect(try frameRanges(renamed).map(\.id) == ["TPE1", "APIC", "TIT2"])
+        #expect(await TagReader.read(url)?.artist == "Artisx")
+        try expectNoTempFiles()
+    }
+
     @Test func tagsThatOutgrowTheirPaddingGetTheFullRewrite() async throws {
         let audio = MP3Fixture.audio()
         let url = try file("grow.mp3", MP3Fixture.id3(version: 3, frames: [MP3Fixture.text("TIT2", "T")], padding: 4) + audio)
@@ -279,6 +324,78 @@ import Testing
         try expectNoTempFiles()
     }
 
+    /// Each metadata block's type and byte range, header included.
+    private func flacBlocks(_ bytes: [UInt8]) throws -> [(type: UInt8, range: Range<Int>)] {
+        var pos = try #require(FLACTag.findMarker(bytes)) + 4
+        var blocks: [(type: UInt8, range: Range<Int>)] = []
+        while true {
+            let header = bytes[pos], end = pos + 4 + bytes.uint24BE(at: pos + 1)
+            blocks.append((header & 0x7F, pos..<end))
+            pos = end
+            if header & 0x80 != 0 { return blocks }
+        }
+    }
+
+    @Test func flacTitleEditsLeaveALargeCoverWhereItIs() async throws {
+        let url = dir.appendingPathComponent("covered.flac")
+        let picture = FLACTag.pictureBody(Artwork(data: Data(LargeCover.bytes), mimeType: "image/jpeg"))
+        try FLACFixture.write(to: url, extraComments: ["TITLE=Old", "REPLAYGAIN_TRACK_GAIN=-3 dB"], padding: 8192, picture: picture)
+        let original = try bytes(url)
+        #expect(try flacBlocks(original).map(\.type).suffix(3) == [4, 6, 1], "comments, cover, then padding")
+        let coverRange = try #require(try flacBlocks(original).first { $0.type == 6 }).range
+        let node = inode(url)
+
+        // The comments grow, and the padding is past the cover: they move into the padding, and
+        // their old place becomes padding of the same size.
+        _ = try await TagFileWriter.write(TagValues(title: "A much longer title than before"), to: url)
+        let moved = try bytes(url)
+        #expect(inode(url) == node, "patched in place")
+        #expect(moved.count == original.count)
+        #expect(try flacBlocks(moved).map(\.type).suffix(4) == [1, 6, 4, 1])
+        #expect(try flacBlocks(moved).first { $0.type == 6 }?.range == coverRange)
+        let ranges = TagFileWriter.changedRanges(from: original, to: moved)
+        #expect(ranges.count == 2 && ranges.reduce(0) { $0 + $1.count } < 1024)
+        #expect(ranges.allSatisfy { !$0.overlaps(coverRange) })
+        let comments = try FLACTag.parseComments(try #require(try FLACTag.parse(moved).blocks.first { $0.type == 4 }).body).entries
+        #expect(comments.contains("TITLE=A much longer title than before") && comments.contains("REPLAYGAIN_TRACK_GAIN=-3 dB"))
+        #expect(try FLACTag.read(moved).artwork?.data == Data(LargeCover.bytes))
+
+        // Now the padding follows the comments, so the next edit is one small write.
+        _ = try await TagFileWriter.write(TagValues(title: "Short", rating: 4), to: url)
+        let retitled = try bytes(url)
+        #expect(inode(url) == node)
+        let next = TagFileWriter.changedRanges(from: moved, to: retitled)
+        #expect(next.count == 1 && next.allSatisfy { !$0.overlaps(coverRange) })
+        #expect(TagValues(title: "Short", rating: 4).isSatisfied(by: try FLACTag.read(retitled)))
+        #expect(Array(retitled[try FLACTag.parse(retitled).audioStart...]) == Array(original[try FLACTag.parse(original).audioStart...]))
+        let duration = try await AVURLAsset(url: url).load(.duration).seconds
+        #expect(abs(duration - 0.5) < 0.05)
+        try expectNoTempFiles()
+    }
+
+    @Test func flacCommentsThatShrinkLeavePaddingInPlace() async throws {
+        let url = dir.appendingPathComponent("shrink.flac")
+        let picture = FLACTag.pictureBody(Artwork(data: Data(LargeCover.bytes), mimeType: "image/jpeg"))
+        try FLACFixture.write(to: url, extraComments: ["COMMENT=A comment to clear"], padding: 512, picture: picture)
+        let original = try bytes(url)
+        let coverRange = try #require(try flacBlocks(original).first { $0.type == 6 }).range
+
+        _ = try await TagFileWriter.write(TagValues(comment: ""), to: url)
+        let written = try bytes(url)
+        #expect(try flacBlocks(written).map(\.type).suffix(4) == [4, 1, 6, 1], "the room left is padding right after the comments")
+        #expect(try flacBlocks(written).first { $0.type == 6 }?.range == coverRange)
+        #expect(TagFileWriter.changedRanges(from: original, to: written).allSatisfy { !$0.overlaps(coverRange) })
+        #expect(try FLACTag.read(written).comment == nil)
+    }
+
+    @Test func aFileThatGetsShorterWhileItsTagsAreReadIsSkipped() throws {
+        // FLAC metadata running past the end: what's left of a file that shrank after it was looked at.
+        let url = try file("shrunk.flac", Array("fLaC".utf8) + [0] + [UInt8].be24(500_000) + [UInt8](repeating: 0, count: 100))
+        #expect(throws: TagWriteError.modifiedSinceRead) {
+            try TagFileWriter.leadingTags(of: url, size: 1_000_000)
+        }
+    }
+
     // MARK: M4A
 
     @Test func m4aItemsRoundTripAndAudioStillDecodes() async throws {
@@ -397,6 +514,50 @@ import Testing
         #expect(rewritten == ["/x/a.mp3", "/x/b.mp3", "/x/playing.mp3"])
         #expect(!queue.isRunning)
     }
+
+    @MainActor @Test func editsMadeWhileAFileIsWrittenAreSavedWithTheValuesBeingWritten() async {
+        let gate = Gate()
+        let queue = TagWriteQueue(retryDelay: .milliseconds(10)) { _, _ in
+            await gate.wait()
+            return .written(fileSize: 1)
+        }
+        var saved: [TagValues?] = []
+        queue.persist = { _, values in saved.append(values) }
+
+        queue.enqueue(TagValues(title: "A"), path: "/x/a.mp3")
+        let deadline = Date().addingTimeInterval(10)
+        while queue.currentPath == nil, Date() < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+        queue.enqueue(TagValues(rating: 4), path: "/x/a.mp3")
+        #expect(saved.last == TagValues(title: "A", rating: 4), "quitting now still leaves the title to write")
+
+        gate.open()
+        await queue.waitUntilIdle()
+        #expect(saved == [TagValues(title: "A"), TagValues(title: "A", rating: 4), TagValues(rating: 4), nil],
+                "once the title is written only the rating is left, then nothing")
+    }
+
+    @MainActor @Test func resumedWritesArentSavedAgain() async {
+        let queue = TagWriteQueue { _, _ in .written(fileSize: 1) }
+        var saved: [String: TagValues?] = [:]
+        queue.persist = { path, values in saved[path] = values }
+        queue.resume([("/x/a.mp3", TagValues(title: "A")), ("/x/b.mp3", TagValues(rating: 2))])
+        #expect(queue.total == 2 && saved.isEmpty)
+        await queue.waitUntilIdle()
+        #expect(queue.written == 2)
+        #expect(saved.count == 2 && saved.values.allSatisfy { $0 == nil }, "each is forgotten once written")
+    }
+}
+
+/// Holds async callers until it's opened.
+final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = false
+
+    func open() { lock.withLock { isOpen = true } }
+
+    func wait() async {
+        while !lock.withLock({ isOpen }) { try? await Task.sleep(for: .milliseconds(5)) }
+    }
 }
 
 // MARK: - Fixtures
@@ -427,9 +588,15 @@ enum MP3Fixture {
     }
 }
 
-/// FLAC files from AVAudioFile's encoder, with extra comments and a padding block added.
+/// Stand-in image bytes for an embedded cover the size of a real one (200 KB).
+enum LargeCover {
+    static let bytes: [UInt8] = (0..<200_000).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ $0 >> 8) }
+}
+
+/// FLAC files from AVAudioFile's encoder, with extra comments, optionally a picture block right
+/// after them, and a padding block at the end.
 enum FLACFixture {
-    static func write(to url: URL, extraComments: [String], padding: Int) throws {
+    static func write(to url: URL, extraComments: [String], padding: Int, picture: [UInt8]? = nil) throws {
         try ToneFile.write(to: url, seconds: 0.5, format: kAudioFormatFLAC)
         let bytes = [UInt8](try Data(contentsOf: url))
         let parsed = try FLACTag.parse(bytes)
@@ -438,6 +605,7 @@ enum FLACFixture {
             var comments = try FLACTag.parseComments(blocks[index].body)
             comments.entries += extraComments
             blocks[index].body = FLACTag.encodeComments(comments)
+            if let picture { blocks.insert(FLACTag.Block(type: 6, body: picture), at: index + 1) }
         }
         blocks.append(FLACTag.Block(type: 1, body: [UInt8](repeating: 0, count: padding)))
         var out = Array("fLaC".utf8)

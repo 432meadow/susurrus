@@ -14,12 +14,15 @@ struct NowPlayingBar: View {
             HStack(spacing: 14) {
                 Button { player.previous() } label: { Image(systemName: "backward.fill") }
                     .help("Previous")
+                    .accessibilityLabel("Previous")
                 Button { player.togglePlayPause() } label: {
                     Image(systemName: player.isPlaying ? "pause.fill" : "play.fill").font(.title2)
                 }
                 .help(player.isPlaying ? "Pause" : "Play")
+                .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
                 Button { player.next() } label: { Image(systemName: "forward.fill") }
                     .help("Next")
+                    .accessibilityLabel("Next")
             }
             .buttonStyle(.borderless)
             .disabled(player.currentTrack == nil)
@@ -30,9 +33,11 @@ struct NowPlayingBar: View {
             VStack(alignment: .leading, spacing: 2) {
                 if let track = player.currentTrack {
                     HStack(spacing: 6) {
-                        Text(track.title.isEmpty ? track.fileName : track.title).font(.headline).lineLimit(1)
+                        Text(track.displayTitle).font(.headline).lineLimit(1)
                             .onTapGesture { model.goToCurrentTrack() }
                             .help("Go to Current Track (⌘L)")
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityHint("Shows it in the track list")
                         if player.isLoading {
                             ProgressView().controlSize(.mini)
                         }
@@ -40,14 +45,20 @@ struct NowPlayingBar: View {
                     if player.isWaitingForShare {
                         Text("Waiting for the network share…")
                             .font(.subheadline).foregroundStyle(Palette.ochre).lineLimit(1)
+                    } else if let error = player.errorMessage, !player.isPlaying {
+                        // Files that wouldn't open (the share gone?): playback waits here, paused.
+                        Text(error).font(.subheadline).foregroundStyle(Palette.error).lineLimit(1)
+                            .help(error)
                     } else {
-                        Text([track.displayArtist, track.album].filter { !$0.isEmpty }.joined(separator: " — "))
+                        Text(track.artistAndAlbum)
                             .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
                             .onTapGesture { if !track.displayArtist.isEmpty { model.showArtist(track.displayArtist) } }
                             .help("Go to Artist")
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityHint("Opens the artist's page")
                     }
                 } else if let error = player.errorMessage {
-                    Text(error).font(.subheadline).foregroundStyle(.red).lineLimit(2)
+                    Text(error).font(.subheadline).foregroundStyle(Palette.error).lineLimit(2)
                 } else {
                     Text("Not Playing").foregroundStyle(.secondary)
                 }
@@ -61,7 +72,7 @@ struct NowPlayingBar: View {
                     }
                     Button("Get Info") { model.showInfo(for: [track]) }
                     Button("Continue in Mixer") { model.continueInMixer() }
-                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: track.path)]) }
+                    Button("Show in Finder") { NSWorkspace.shared.reveal([track]) }
                 }
             }
 
@@ -90,25 +101,32 @@ struct NowPlayingBar: View {
                     Image(systemName: "shuffle").foregroundStyle(player.shuffle ? Palette.warm : .secondary)
                 }
                 .help(player.shuffle ? "Shuffle is on" : "Shuffle is off")
+                .toggleAccessibility("Shuffle", isOn: player.shuffle)
                 Button { player.cycleRepeatMode() } label: {
                     Image(systemName: player.repeatMode == .one ? "repeat.1" : "repeat")
                         .foregroundStyle(player.repeatMode == .off ? .secondary : Palette.warm)
                 }
                 .help("Repeat: \(player.repeatMode.rawValue)")
+                .accessibilityLabel("Repeat")
+                .accessibilityValue(player.repeatMode.rawValue)
                 Button { model.isShowingUpNext.toggle() } label: {
                     Image(systemName: "list.bullet").foregroundStyle(model.isShowingUpNext ? Palette.warm : .secondary)
                 }
                 .help("Up Next")
+                .toggleAccessibility("Up Next", isOn: model.isShowingUpNext)
                 Button { openWindow(id: "equalizer") } label: {
                     Image(systemName: "slider.vertical.3")
                         .foregroundStyle(player.equalizer.isEnabled ? Palette.warm : .secondary)
                 }
                 .help("Equalizer")
+                .accessibilityLabel("Equalizer")
+                .accessibilityValue(player.equalizer.isEnabled ? "On" : "Off")
                 Button { model.isShowingMixer.toggle() } label: {
                     Image(systemName: "dial.medium")
                         .foregroundStyle(model.isShowingMixer ? Palette.warm : .secondary)
                 }
                 .help("Mixer (⇧⌘M)")
+                .toggleAccessibility("Mixer", isOn: model.isShowingMixer)
                 OutputMenu()
                 AirPlayButton()
                     .frame(width: 22, height: 22)
@@ -118,7 +136,9 @@ struct NowPlayingBar: View {
 
             HStack(spacing: 6) {
                 Image(systemName: "speaker.fill").foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 Slider(value: $player.volume, in: 0...1).frame(width: 80)
+                    .accessibilityLabel("Volume")
             }
         }
         .padding(.horizontal, 16)
@@ -149,7 +169,8 @@ private struct OutputMenu: View {
                 }
             }
         } label: {
-            Image(systemName: "hifispeaker")
+            // A Label, not a bare Image: VoiceOver keeps its name ("Output device") across redraws.
+            Label("Output device", systemImage: "hifispeaker").labelStyle(.iconOnly)
         }
         .menuIndicator(.hidden)
         .fixedSize()
@@ -167,4 +188,14 @@ private struct AirPlayButton: NSViewRepresentable {
     }
 
     func updateNSView(_ picker: AVRoutePickerView, context: Context) {}
+}
+
+extension View {
+    /// For icon buttons that switch something on and off: says what they are and whether it's on,
+    /// since the colour alone doesn't.
+    func toggleAccessibility(_ label: String, isOn: Bool) -> some View {
+        accessibilityLabel(label)
+            .accessibilityValue(isOn ? "On" : "Off")
+            .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
 }

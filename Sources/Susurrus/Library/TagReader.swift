@@ -27,6 +27,16 @@ struct ScannedTrack: Sendable {
     var dateCreated: Date?
     var dateModified: Date?
     var bookmark: Data?
+    /// Values that came from the file's name and folders rather than its tags.
+    var inferred: InferredFields = []
+}
+
+/// Which of a scanned track's values were guessed from its file name and folders.
+struct InferredFields: OptionSet, Sendable {
+    let rawValue: Int
+    static let title = InferredFields(rawValue: 1)
+    static let album = InferredFields(rawValue: 2)
+    static let artist = InferredFields(rawValue: 4)
 }
 
 /// Reads tags with AVFoundation (ID3, iTunes/MP4, and whatever it exposes for FLAC/WAV/AIFF),
@@ -46,12 +56,16 @@ enum TagReader {
         var track = ScannedTrack(path: url.path)
         track.duration = duration.seconds
 
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey, .contentModificationDateKey])
-        track.fileSize = Int64(values?.fileSize ?? 0)
-        track.dateCreated = values?.creationDate
-        track.dateModified = values?.contentModificationDate
+        // Plain file system calls, which can hang on a stalled network share.
+        let file = await BlockingIO.library.run { () -> (size: Int, created: Date?, modified: Date?, bookmark: Data?) in
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .creationDateKey, .contentModificationDateKey])
+            return (values?.fileSize ?? 0, values?.creationDate, values?.contentModificationDate, try? url.bookmarkData())
+        }
+        track.fileSize = Int64(file.size)
+        track.dateCreated = file.created
+        track.dateModified = file.modified
         track.bitRate = track.duration > 0 ? Int(Double(track.fileSize) * 8 / track.duration / 1000) : 0
-        track.bookmark = try? url.bookmarkData()
+        track.bookmark = file.bookmark
 
         if let audio = try? await asset.loadTracks(withMediaType: .audio).first,
            let description = try? await audio.load(.formatDescriptions).first,
@@ -114,9 +128,16 @@ enum TagReader {
         let components = url.deletingPathExtension().pathComponents
         if track.title.isEmpty {
             track.title = Self.titleFromFileName(url.deletingPathExtension().lastPathComponent)
+            track.inferred.insert(.title)
         }
-        if track.album.isEmpty, components.count >= 2 { track.album = components[components.count - 2] }
-        if track.artist.isEmpty, components.count >= 3 { track.artist = components[components.count - 3] }
+        if track.album.isEmpty, components.count >= 2 {
+            track.album = components[components.count - 2]
+            track.inferred.insert(.album)
+        }
+        if track.artist.isEmpty, components.count >= 3 {
+            track.artist = components[components.count - 3]
+            track.inferred.insert(.artist)
+        }
         return track
     }
 

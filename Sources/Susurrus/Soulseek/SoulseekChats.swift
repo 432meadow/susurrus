@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 
@@ -33,7 +34,13 @@ final class SoulseekChats {
 
     @ObservationIgnored private let fileURL: URL?
     private static let maxMessagesPerConversation = 2000
+    /// Beyond this many conversations, the oldest ones without unread messages are let go.
+    private static let maxConversations = 500
     nonisolated private static let writeQueue = DispatchQueue(label: "susurrus.soulseek.chats", qos: .utility)
+    /// The latest history per file, waiting to be written; touched on `writeQueue` only.
+    nonisolated(unsafe) private static var pendingWrites: [URL: [SoulseekConversation]] = [:]
+    nonisolated(unsafe) private static var isWriteScheduled = false
+    private static var flushesAtQuit = false
 
     nonisolated static var defaultURL: URL {
         LibraryStore.supportDirectory.appendingPathComponent("susurrus/Soulseek/Messages.json")
@@ -42,6 +49,12 @@ final class SoulseekChats {
     /// `fileURL` nil keeps history in memory only.
     init(fileURL: URL? = SoulseekChats.defaultURL) {
         self.fileURL = fileURL
+        if fileURL != nil, !Self.flushesAtQuit {
+            Self.flushesAtQuit = true
+            NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+                SoulseekChats.flushWrites()
+            }
+        }
         guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -60,6 +73,7 @@ final class SoulseekChats {
     func open(_ user: String) {
         guard conversation(with: user) == nil else { return }
         conversations.insert(SoulseekConversation(user: user), at: 0)
+        trimConversations(keeping: user)
         save()
     }
 
@@ -113,24 +127,47 @@ final class SoulseekChats {
         if unread { conversation.unread += 1 }
         let position = conversations.firstIndex { $0.lastDate <= conversation.lastDate } ?? conversations.count
         conversations.insert(conversation, at: position)
+        trimConversations(keeping: user)
         save()
     }
 
-    /// Writes the whole history off the main thread, in order.
-    private func save() {
-        guard let fileURL else { return }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(conversations) else { return }
-        Self.writeQueue.async {
-            try? FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? data.write(to: fileURL, options: .atomic)
+    /// Lets the oldest read conversations go once there are too many.
+    private func trimConversations(keeping user: String) {
+        while conversations.count > Self.maxConversations,
+              let oldest = conversations.lastIndex(where: { $0.unread == 0 && $0.user != user }) {
+            conversations.remove(at: oldest)
         }
     }
 
-    /// Waits for pending writes (tests read the file straight back).
+    /// Saves the whole history soon: changes in quick succession (a burst of offline messages)
+    /// are written once, encoded off the main thread.
+    private func save() {
+        guard let fileURL else { return }
+        let conversations = conversations
+        Self.writeQueue.async {
+            Self.pendingWrites[fileURL] = conversations
+            guard !Self.isWriteScheduled else { return }
+            Self.isWriteScheduled = true
+            Self.writeQueue.asyncAfter(deadline: .now() + 0.5) { Self.writePending() }
+        }
+    }
+
+    /// Call on `writeQueue`.
+    nonisolated private static func writePending() {
+        isWriteScheduled = false
+        let writes = pendingWrites
+        pendingWrites = [:]
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        for (url, conversations) in writes {
+            guard let data = try? encoder.encode(conversations) else { continue }
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Writes pending changes now (at quit, and in tests that read the file straight back).
     nonisolated static func flushWrites() {
-        writeQueue.sync {}
+        writeQueue.sync { writePending() }
     }
 }

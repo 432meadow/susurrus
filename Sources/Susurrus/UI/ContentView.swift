@@ -13,44 +13,33 @@ struct ContentView: View {
                 SidebarView()
                     .navigationSplitViewColumnWidth(min: 180, ideal: 220)
             } detail: {
-                Group {
-                    switch model.selection {
-                    case .albums:
-                        AlbumGridView()
-                    case .soulseek:
-                        SoulseekView()
-                    case .artists:
-                        ArtistsView()
-                    case .stats:
-                        StatsView()
-                    case .browser:
-                        VSplitView {
-                            BrowserColumnsView()
-                                .frame(minHeight: 120, idealHeight: 200, maxHeight: 400)
-                            TrackTableView()
-                                .frame(minHeight: 200)
+                detail
+                    .overlay { if model.selection?.isCustomView != true { emptyState } }
+                    .overlay(alignment: .bottomTrailing) { NoticeStack().padding(16) }
+                    .modifier(PaletteTitle(subtitle: subtitle))
+                    .toolbar {
+                        if !model.activities.isEmpty {
+                            ToolbarItem(placement: .primaryAction) { ActivityButton() }
                         }
-                    default:
-                        TrackTableView()
                     }
-                }
-                .overlay { if model.selection?.isCustomView != true { emptyState } }
-                .modifier(PaletteTitle(subtitle: subtitle))
-                .inspector(isPresented: $model.isShowingUpNext) {
-                    // Only build the queue list while the panel is open.
-                    if model.isShowingUpNext {
-                        UpNextView()
-                            .inspectorColumnWidth(min: 260, ideal: 320, max: 480)
+                    .inspector(isPresented: $model.isShowingUpNext) {
+                        // Only build the queue list while the panel is open.
+                        if model.isShowingUpNext {
+                            UpNextView()
+                                .inspectorColumnWidth(min: 260, ideal: 320, max: 480)
+                        }
                     }
-                }
             }
-            .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search  (artist:, bpm:120-128, key:~8A, rating:>=4…)")
 
             if model.isShowingMixer {
                 MixerView()
             }
             NowPlayingBar()
         }
+        .background(WindowReader { window in
+            model.mainWindow = window
+            WindowKeys.install(for: model)
+        })
         .sheet(item: Binding(
             get: { model.infoTracks.map(InfoSheetItem.init) },
             set: { model.infoTracks = $0?.tracks }
@@ -75,21 +64,64 @@ struct ContentView: View {
                 model.pendingRemoval = nil
             }
         } message: {
-            Text("The files stay where they are, but play counts, ratings and playlist entries for these tracks are lost. This can't be undone.")
+            Text(removalMessage)
+        }
+        .confirmationDialog("Write the covers into the files too?", isPresented: Binding(
+            get: { model.pendingCoverSearch != nil },
+            set: { if !$0 { model.pendingCoverSearch = nil } }
+        ), presenting: model.pendingCoverSearch) { albums in
+            Button("Find and Write into Files") { model.findMissingCovers(for: albums, writeToFiles: true) }
+            Button("Find Only") { model.findMissingCovers(for: albums, writeToFiles: false) }
+        } message: { albums in
+            let files = albums.reduce(0) { $0 + $1.tracks.count }
+            Text("Covers that are found show right away. Writing them into the files too rewrites every track of each album that gets one — up to \(files.formatted()) \(files == 1 ? "file" : "files") here, one at a time in the background, which can take hours on a slow network share.")
         }
     }
 
+    /// The library search sits in the toolbar only on the panes it filters.
+    @ViewBuilder private var detail: some View {
+        @Bindable var model = model
+        let search = Binding(get: { model.searchText }, set: { model.searchText = $0 })
+        switch model.selection {
+        case .albums:
+            AlbumGridView()
+                .searchable(text: search, placement: .toolbar, prompt: "Search  (artist:, year:>2000, genre:…)")
+        case .soulseek:
+            SoulseekView()
+        case .artists:
+            ArtistsView()
+                .searchable(text: search, placement: .toolbar, prompt: "Filter artists")
+        case .stats:
+            StatsView()
+        case .browser:
+            VSplitView {
+                BrowserColumnsView()
+                    .frame(minHeight: 120, idealHeight: 200, maxHeight: 400)
+                TrackTableView()
+                    .frame(minHeight: 200)
+            }
+            .searchable(text: search, placement: .toolbar, prompt: Self.searchPrompt)
+        default:
+            TrackTableView()
+                .searchable(text: search, placement: .toolbar, prompt: Self.searchPrompt)
+        }
+    }
+
+    private static let searchPrompt = "Search  (artist:, bpm:120-128, key:~8A, rating:>=4…)"
+
     @ViewBuilder private var emptyState: some View {
-        if let error = model.fatalError {
+        if let error = model.libraryError {
             ContentUnavailableView("Library Unavailable", systemImage: "exclamationmark.triangle", description: Text(error))
         } else if model.tracks.isEmpty {
             ContentUnavailableView {
                 Label("No Music Yet", systemImage: "music.note.list")
             } description: {
-                Text("Add music files or folders. They stay where they are.")
+                Text(model.isScanning ? "Adding your music…" : "Add music files or folders. They stay where they are.")
             } actions: {
-                Button("Add to Library…") { model.chooseFilesToAdd() }
-                    .buttonStyle(.borderedProminent)
+                if !model.isScanning {
+                    Button("Add to Library…") { model.chooseFilesToAdd() }
+                        .buttonStyle(.borderedProminent)
+                }
             }
         } else if model.isLoadingSelection, model.visibleTracks.isEmpty {
             ProgressView()
@@ -127,35 +159,26 @@ struct ContentView: View {
         return count == 1 ? "Remove 1 track from the library?" : "Remove \(count.formatted()) tracks from the library?"
     }
 
+    /// Names the tracks, so it's clear which ones go.
+    private var removalMessage: String {
+        let tracks = model.pendingRemoval ?? []
+        var names = tracks.prefix(3).map { "“\($0.displayTitle)”" }
+        if tracks.count > names.count { names.append("\((tracks.count - names.count).formatted()) more") }
+        return ListFormatter.localizedString(byJoining: names)
+            + ". The files stay where they are; their play counts, ratings and playlist entries are lost. This can't be undone."
+    }
+
     private var subtitle: String {
         if model.selection == .soulseek || model.selection == .stats { return "" }
         if model.selection == .artists { return "\(model.artists.artists.count.formatted()) artists" }
         let tracks = model.visibleTracks
         let seconds = tracks.reduce(0) { $0 + $1.length }
         let span = Duration.seconds(seconds).formatted(.units(allowed: [.days, .hours, .minutes], width: .abbreviated, maximumUnitCount: 2))
-        var writing = model.tagWriter.isRunning
-            ? " · Writing tags \(model.tagWriter.done.formatted())/\(model.tagWriter.total.formatted())" : ""
-        if model.isCheckingForMissingFiles {
-            writing += " · Checking files…"
-        }
-        if let status = model.exchange.status {
-            writing += " · \(status)"
-        }
-        if model.bpmAnalyzer.isRunning {
-            writing += " · Detecting BPM \(model.bpmAnalyzer.done.formatted())/\(model.bpmAnalyzer.total.formatted())"
-        }
-        if model.keyAnalyzer.isRunning {
-            writing += " · Detecting keys \(model.keyAnalyzer.done.formatted())/\(model.keyAnalyzer.total.formatted())"
-        }
-        if let search = model.coverSearch {
-            writing += " · Finding covers \(search.done.formatted())/\(search.total.formatted())"
-        } else if let summary = model.coverSearchSummary {
-            writing += " · \(summary)"
-        }
+        let activity = model.activities.map { " · " + $0.summary }.joined()
         if model.selection == .albums {
-            return "\(model.albums.count.formatted()) albums · \(tracks.count.formatted()) tracks · \(span)\(writing)"
+            return "\(model.albums.count.formatted()) albums · \(tracks.count.formatted()) tracks · \(span)\(activity)"
         }
-        return "\(tracks.count.formatted()) tracks · \(span)\(writing)"
+        return "\(tracks.count.formatted()) tracks · \(span)\(activity)"
     }
 }
 

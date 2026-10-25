@@ -19,13 +19,19 @@ import Foundation
 /// the start of the file and usually have padding), only the tag bytes are read and only the bytes
 /// that changed are written back in place, then read back and compared. Over a slow share that's a
 /// few KB instead of the whole file several times over. The audio is never written to; if the
-/// patched bytes don't read back as written, the old bytes are put back.
+/// patched bytes don't read back as written, the old bytes are put back. Changes bigger than
+/// `maxPatchBytes` take the full rewrite instead: a connection that drops in the middle of a long
+/// write in place would leave the tags half old and half new.
 enum TagFileWriter {
     enum Outcome: Equatable {
         case written(fileSize: Int64)
         /// The file already held these values.
         case unchanged
     }
+
+    /// The most bytes the fast path writes in place. That's one quick request to the share, so a
+    /// dropped connection rarely catches it halfway.
+    static let maxPatchBytes = 64 * 1024
 
     /// `beforeReplace` runs after verification, just before the final modification-date check
     /// (tests use it to simulate another app touching the file).
@@ -66,58 +72,98 @@ enum TagFileWriter {
         return .written(fileSize: Int64(rewritten.count))
     }
 
-    /// The fast path (see above). nil: the tags don't fit or the format can't be patched; do the
-    /// full rewrite.
+    /// The fast path (see above). nil: the tags don't fit, the change is too big to patch in
+    /// place, or the format can't be patched; do the full rewrite.
     private static func patchInPlace(_ values: TagValues, url: URL, before: Stamp,
                                      beforeReplace: (() throws -> Void)?) throws -> Outcome? {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var head = [UInt8](try handle.read(upToCount: min(before.size, 256 * 1024)) ?? Data())
-        guard let format = try? TagFormats.handler(for: url, bytes: head) else { return nil }
-        var region = format.tagRegion(in: head)
-        while region == .needMore, head.count < before.size {
-            // FLAC metadata blocks (artwork) can run past the first read.
-            head += [UInt8](try handle.read(upToCount: min(head.count * 4, before.size - head.count)) ?? Data())
-            region = format.tagRegion(in: head)
-        }
-        guard case .length(let length) = region, length > 0, length < before.size else { return nil }
-        if head.count < length {
-            head += [UInt8](try handle.read(upToCount: length - head.count) ?? Data())
-            guard head.count == length else { return nil }
-        } else {
-            head.removeLast(head.count - length)
-        }
+        guard let (format, head) = try leadingTags(of: url, size: before.size) else { return nil }
         guard stamp(url) == before else { throw TagWriteError.modifiedSinceRead }
 
         let rewritten = try format.rewrite(head, with: values)
         if rewritten == head { return .unchanged }
         guard rewritten.count == head.count else { return nil }
         try format.verify(original: head, rewritten: rewritten, values: values)
-
-        let first = rewritten.indices.first { rewritten[$0] != head[$0] }!
-        let last = rewritten.indices.last { rewritten[$0] != head[$0] }!
-        let patch = Array(rewritten[first...last]), old = Array(head[first...last])
+        let ranges = changedRanges(from: head, to: rewritten)
+        guard ranges.reduce(0, { $0 + $1.count }) <= maxPatchBytes else { return nil }
 
         try beforeReplace?()
         guard stamp(url) == before else { throw TagWriteError.modifiedSinceRead }
         let fd = open(url.path, O_RDWR)
         guard fd >= 0 else { throw posixError("Couldn't open the file for writing") }
         defer { close(fd) }
-        func put(_ bytes: [UInt8]) throws {
-            let n = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress, bytes.count, off_t(first)) }
+        func put(_ bytes: ArraySlice<UInt8>, at offset: Int) throws {
+            let n = bytes.withUnsafeBytes { pwrite(fd, $0.baseAddress, bytes.count, off_t(offset)) }
             guard n == bytes.count, fsync(fd) == 0 else { throw posixError("Couldn't write the tags") }
         }
-        func onDisk() -> [UInt8] {
-            var buffer = [UInt8](repeating: 0, count: patch.count)
-            let n = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress, patch.count, off_t(first)) }
-            return n == patch.count ? buffer : []
+        func onDisk(_ range: Range<Int>) -> [UInt8] {
+            var buffer = [UInt8](repeating: 0, count: range.count)
+            let n = buffer.withUnsafeMutableBytes { pread(fd, $0.baseAddress, range.count, off_t(range.lowerBound)) }
+            return n == range.count ? buffer : []
         }
-        try put(patch)
-        guard onDisk() == patch, stamp(url)?.size == before.size else {
-            try? put(old)
-            throw TagWriteError.verificationFailed("the tags on disk differ; the old ones were put back")
+        // Later ranges first: when FLAC comments move into the padding further on, the new block
+        // is in place before the old one becomes padding, so the file never lacks its comments.
+        var touched: [Range<Int>] = []
+        do {
+            for range in ranges.reversed() {
+                touched.append(range)
+                try put(rewritten[range], at: range.lowerBound)
+            }
+            guard touched.allSatisfy({ onDisk($0) == Array(rewritten[$0]) }), stamp(url)?.size == before.size else {
+                throw TagWriteError.verificationFailed("the tags on disk differ")
+            }
+        } catch {
+            // Put the old bytes back, undoing the writes in reverse order.
+            guard touched.reversed().allSatisfy({ (try? put(head[$0], at: $0.lowerBound)) != nil }) else {
+                throw TagWriteError.partlyWritten
+            }
+            guard case .verificationFailed(let what)? = error as? TagWriteError else { throw error }
+            throw TagWriteError.verificationFailed("\(what); the old ones were put back")
         }
         return .written(fileSize: Int64(before.size))
+    }
+
+    /// The tags at the start of the file (`size` bytes long when it was looked at) and their
+    /// format, read without the audio. nil: the format has no leading tags to patch.
+    static func leadingTags(of url: URL, size: Int) throws -> (format: TagFormat.Type, bytes: [UInt8])? {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var head = [UInt8](try handle.read(upToCount: min(size, 256 * 1024)) ?? Data())
+        guard let format = try? TagFormats.handler(for: url, bytes: head) else { return nil }
+        var region = format.tagRegion(in: head)
+        while region == .needMore, head.count < size {
+            // FLAC metadata blocks (artwork) can run past the first read.
+            let more = try handle.read(upToCount: min(head.count * 4, size - head.count)) ?? Data()
+            // The file ends sooner than it did a moment ago: it's being changed.
+            guard !more.isEmpty else { throw TagWriteError.modifiedSinceRead }
+            head += [UInt8](more)
+            region = format.tagRegion(in: head)
+        }
+        guard case .length(let length) = region, length > 0, length < size else { return nil }
+        if head.count < length {
+            head += [UInt8](try handle.read(upToCount: length - head.count) ?? Data())
+            guard head.count == length else { return nil }
+        } else {
+            head.removeLast(head.count - length)
+        }
+        return (format, head)
+    }
+
+    /// Where `new` differs from `old` (the same length), with ranges less than `gap` bytes apart
+    /// joined: another round trip to the share costs more than a few KB of unchanged bytes.
+    static func changedRanges(from old: [UInt8], to new: [UInt8], gap: Int = 4096) -> [Range<Int>] {
+        var ranges: [Range<Int>] = []
+        var start = 0
+        while let first = old[start...].indices.first(where: { old[$0] != new[$0] }) {
+            var end = first + 1
+            while end < old.count, old[end] != new[end] { end += 1 }
+            if let last = ranges.last, first - last.upperBound < gap {
+                ranges[ranges.count - 1] = last.lowerBound..<end
+            } else {
+                ranges.append(first..<end)
+            }
+            start = end
+        }
+        return ranges
     }
 
     private static func posixError(_ message: String) -> NSError {

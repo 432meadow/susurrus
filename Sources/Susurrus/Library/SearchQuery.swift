@@ -95,7 +95,7 @@ struct SearchQuery {
                 return Term(condition: condition, negated: negated)
             }
         }
-        return token.isEmpty ? nil : Term(condition: .anywhere(token), negated: negated)
+        return token.isEmpty ? nil : Term(condition: .anywhere(TextKey.folded(token)), negated: negated)
     }
 
     private static let aliases: [String: String] = [

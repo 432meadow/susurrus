@@ -52,6 +52,78 @@ import Testing
         #expect(snapshot.matches(query: "-live", limit: 50).isEmpty, "exclusions alone match nothing")
     }
 
+    @Test func indexMatchesWholeWords() throws {
+        let (folder, cleanup) = try makeShare()
+        defer { cleanup() }
+        let snapshot = SlskShareScanner.scan(folder: folder) { _ in nil }
+
+        #expect(snapshot.matches(query: "seeland live", limit: 50).count == 1)
+        #expect(snapshot.matches(query: "seel", limit: 50).isEmpty, "words match whole")
+        #expect(snapshot.matches(query: "my music isi", limit: 50).count == 1)
+        #expect(snapshot.matches(query: "neu 75 -seeland-live", limit: 50).count == 1)
+        #expect(snapshot.matches(query: "neu", limit: 1).count == 1, "the limit holds")
+        // Searches no one types aren't answered.
+        #expect(snapshot.matches(query: "neu " + String(repeating: "x", count: 300), limit: 50).isEmpty)
+        #expect(snapshot.matches(query: Array(repeating: "neu", count: 13).joined(separator: " "), limit: 50).isEmpty)
+    }
+
+    /// The share built from library tracks: no disk access (these paths don't exist), library
+    /// details advertised, and only files inside the folder and not hidden.
+    @Test func libraryTracksAreSharedWithoutTouchingTheDisk() throws {
+        let folder = URL(fileURLWithPath: "/Volumes/Nowhere/Music")
+        let library = [
+            SlskLibraryFile(path: "/Volumes/Nowhere/Music/Artist/Album/01 One.flac", size: 30_000_000,
+                            attributes: SlskFileAttributes(durationSeconds: 200, sampleRate: 44_100, bitDepth: 16)),
+            SlskLibraryFile(path: "/Volumes/Nowhere/Music/Artist/Album/02 Two.mp3", size: 8_000_000,
+                            attributes: SlskFileAttributes(bitrate: 320, durationSeconds: 180)),
+            SlskLibraryFile(path: "/Volumes/Nowhere/Other/elsewhere.mp3", size: 1, attributes: SlskFileAttributes()),
+            SlskLibraryFile(path: "/Volumes/Nowhere/Music/.hidden/x.mp3", size: 1, attributes: SlskFileAttributes()),
+            // Size unknown to the library: left to a walk.
+            SlskLibraryFile(path: "/Volumes/Nowhere/Music/Artist/Album/03 Three.mp3", size: 0, attributes: SlskFileAttributes()),
+        ]
+        let extra = [SlskFoundFile(path: "/Volumes/Nowhere/Music/Loose/track.ogg", size: 500)]
+
+        let snapshot = SlskShareScanner.snapshot(folder: folder, library: library, extra: extra)
+
+        #expect(snapshot.files.map(\.virtualPath) == [
+            #"Music\Artist\Album\01 One.flac"#, #"Music\Artist\Album\02 Two.mp3"#, #"Music\Loose\track.ogg"#,
+        ])
+        #expect(snapshot.folderCount == 2)
+        let flac = try #require(snapshot.filesByVirtualPath[#"Music\Artist\Album\01 One.flac"#])
+        #expect(flac.size == 30_000_000)
+        #expect(flac.sampleRate == 44_100)
+        #expect(flac.bitDepth == 16)
+        #expect(snapshot.filesByVirtualPath[#"Music\Artist\Album\02 Two.mp3"#]?.bitrate == 320)
+        #expect(snapshot.matches(query: "artist two", limit: 10).count == 1)
+        #expect(SlskShareScanner.knownPaths(library).count == 4, "all but the unknown size")
+    }
+
+    @Test func walksFindOnlyWhatTheLibraryDoesntHave() throws {
+        let (folder, cleanup) = try makeShare()
+        defer { cleanup() }
+        let known = folder.appendingPathComponent("Neu!/Neu! 75/01 Isi.flac").standardizedFileURL.path
+
+        let found = SlskShareScanner.walk(folder, skipping: [known])
+
+        #expect(Set(found.map { ($0.path as NSString).lastPathComponent }) == ["02 Seeland (Live).mp3", "loose track.m4a"])
+        #expect(found.first { $0.path.hasSuffix(".m4a") }?.size == 500)
+    }
+
+    @Test func walkFindingsAreKeptForTheNextLaunch() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("susurrus-share-walk-\(UUID().uuidString)/Share.json")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let walk = SlskShareWalk(folder: "/Music", date: Date(timeIntervalSince1970: 1_700_000_000),
+                                 files: [SlskFoundFile(path: "/Music/a.mp3", size: 12)])
+        walk.save(to: url)
+
+        let loaded = try #require(SlskShareWalk.load(from: url))
+        #expect(loaded.folder == "/Music")
+        #expect(loaded.date == walk.date)
+        #expect(loaded.files.map(\.path) == ["/Music/a.mp3"])
+        #expect(loaded.files.map(\.size) == [12])
+    }
+
     @Test func browsePayloadListsFoldersAndFiles() throws {
         let (folder, cleanup) = try makeShare()
         defer { cleanup() }

@@ -96,12 +96,17 @@ struct SlskReader {
         return UInt64(high) << 32 | UInt64(low)
     }
 
+    /// The largest file size believed from a peer (1 PiB). Anything bigger is garbage, and would
+    /// overflow conversions and sums further on.
+    static let maxFileSize: UInt64 = 1 << 50
+
     /// File sizes: Soulseek NS sends garbage in the high half of >2 GiB sizes
-    /// (high u32 = 0xFFFFFFFF); fall back to the low half, as Nicotine+ does.
-    mutating func fileSize() throws -> UInt64 {
-        let value = try u64()
-        if value >> 32 == 0xFFFF_FFFF { return value & 0xFFFF_FFFF }
-        return value
+    /// (high u32 = 0xFFFFFFFF); fall back to the low half, as Nicotine+ does. Sizes still above
+    /// `maxFileSize` come back nil.
+    mutating func fileSize() throws -> UInt64? {
+        var value = try u64()
+        if value >> 32 == 0xFFFF_FFFF { value &= 0xFFFF_FFFF }
+        return value <= Self.maxFileSize ? value : nil
     }
 
     mutating func string() throws -> String {
@@ -127,32 +132,62 @@ struct SlskReader {
 /// (the prefix is stripped; the returned payload starts with the message code).
 struct SlskFrameBuffer {
     static let maxFrameSize = 16 << 20
+    /// Share lists (peer code 5) of very big shares run past `maxFrameSize`.
+    static let maxLargeFrameSize = 96 << 20
 
     private var buffer = Data()
+    /// Where the unread bytes in `buffer` start; consumed frames are dropped in bulk.
+    private var start = 0
+    /// Frames with this message code may be up to `maxLargeFrameSize`.
+    var largeFrameCode: UInt32?
 
     mutating func append(_ chunk: Data) {
+        if start > 0, start >= buffer.count - start {
+            buffer = buffer.subdata(in: buffer.startIndex + start ..< buffer.endIndex)
+            start = 0
+        }
         buffer.append(chunk)
     }
 
     mutating func nextFrame() throws -> Data? {
-        guard buffer.count >= 4 else { return nil }
-        var length: UInt32 = 0
-        for i in 0 ..< 4 { length |= UInt32(buffer[buffer.startIndex + i]) << (8 * i) }
-        guard length <= UInt32(Self.maxFrameSize) else {
-            throw SlskError(message: "oversized frame (\(length) bytes)")
+        let available = buffer.count - start
+        guard available >= 4 else { return nil }
+        let length = u32(at: start)
+        if length > UInt32(Self.maxFrameSize) {
+            guard let largeFrameCode, length <= UInt32(Self.maxLargeFrameSize) else {
+                throw SlskError(message: "oversized frame (\(length) bytes)")
+            }
+            guard available >= 8 else { return nil }
+            guard u32(at: start + 4) == largeFrameCode else {
+                throw SlskError(message: "oversized frame (\(length) bytes)")
+            }
         }
         let total = 4 + Int(length)
-        guard buffer.count >= total else { return nil }
-        let frame = Data(buffer[buffer.startIndex + 4 ..< buffer.startIndex + total])
-        buffer = Data(buffer.dropFirst(total))
+        guard available >= total else { return nil }
+        let first = buffer.startIndex + start
+        let frame = buffer.subdata(in: first + 4 ..< first + total)
+        start += total
+        if start == buffer.count {
+            buffer = Data()
+            start = 0
+        }
         return frame
     }
 
     /// Hands over whatever is buffered, unframed. File (`F`) connections switch to raw bytes
     /// after their init frame, so anything already read belongs to the file stream.
     mutating func drainRemaining() -> Data {
-        defer { buffer = Data() }
-        return buffer
+        defer {
+            buffer = Data()
+            start = 0
+        }
+        return buffer.subdata(in: buffer.startIndex + start ..< buffer.endIndex)
+    }
+
+    private func u32(at offset: Int) -> UInt32 {
+        var value: UInt32 = 0
+        for i in 0 ..< 4 { value |= UInt32(buffer[buffer.startIndex + offset + i]) << (8 * i) }
+        return value
     }
 }
 
@@ -161,22 +196,37 @@ struct SlskFrameBuffer {
 /// Search results and share lists travel zlib-wrapped (RFC 1950: 2-byte header,
 /// deflate body, adler32 trailer). Apple's Compression handles the raw deflate part.
 enum SlskZlib {
-    static func inflate(_ data: Data) throws -> Data {
+    /// Inflating stops here, so a small hostile payload can't balloon in memory.
+    static let maxInflatedSize = 16 << 20
+    /// Share lists (peer code 5) of very big shares inflate past `maxInflatedSize`.
+    static let maxShareListSize = 192 << 20
+
+    static func inflate(_ data: Data, limit: Int = maxInflatedSize) throws -> Data {
+        try run(try deflateBody(of: data), operation: COMPRESSION_STREAM_DECODE, limit: limit, stopsAtLimit: false)
+    }
+
+    /// Up to the first `count` inflated bytes, without inflating the rest.
+    static func inflatePrefix(_ data: Data, count: Int) throws -> Data {
+        try run(try deflateBody(of: data), operation: COMPRESSION_STREAM_DECODE, limit: count, stopsAtLimit: true)
+    }
+
+    static func deflate(_ data: Data) throws -> Data {
+        var out = Data([0x78, 0x9C])
+        out += try run(data, operation: COMPRESSION_STREAM_ENCODE, limit: .max, stopsAtLimit: false)
+        var adler = adler32(data).bigEndian
+        withUnsafeBytes(of: &adler) { out.append(contentsOf: $0) }
+        return out
+    }
+
+    /// The raw deflate stream inside a zlib wrapper.
+    private static func deflateBody(of data: Data) throws -> Data {
         guard data.count > 6 else { throw SlskError(message: "compressed payload too short") }
         let header = data[data.startIndex]
         let flags = data[data.startIndex + 1]
         guard header & 0x0F == 8, flags & 0x20 == 0 else {
             throw SlskError(message: "unsupported zlib header")
         }
-        return try run(Data(data.dropFirst(2)), operation: COMPRESSION_STREAM_DECODE)
-    }
-
-    static func deflate(_ data: Data) throws -> Data {
-        var out = Data([0x78, 0x9C])
-        out += try run(data, operation: COMPRESSION_STREAM_ENCODE)
-        var adler = adler32(data).bigEndian
-        withUnsafeBytes(of: &adler) { out.append(contentsOf: $0) }
-        return out
+        return data.dropFirst(2)
     }
 
     static func adler32(_ data: Data) -> UInt32 {
@@ -188,7 +238,11 @@ enum SlskZlib {
         return b << 16 | a
     }
 
-    private static func run(_ input: Data, operation: compression_stream_operation) throws -> Data {
+    /// Runs the stream over `input`. Output beyond `limit` is an error, or — with `stopsAtLimit` —
+    /// where it stops, returning what it has.
+    private static func run(
+        _ input: Data, operation: compression_stream_operation, limit: Int, stopsAtLimit: Bool
+    ) throws -> Data {
         var output = Data()
         let bufferSize = 64 << 10
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
@@ -201,7 +255,9 @@ enum SlskZlib {
         }
         defer { compression_stream_destroy(streamPointer) }
 
-        try input.withUnsafeBytes { (inputBytes: UnsafeRawBufferPointer) in
+        // An empty input still needs a valid pointer; its size stays 0.
+        let source = input.isEmpty ? Data([0]) : input
+        try source.withUnsafeBytes { (inputBytes: UnsafeRawBufferPointer) in
             streamPointer.pointee.src_ptr = inputBytes.bindMemory(to: UInt8.self).baseAddress!
             streamPointer.pointee.src_size = input.count
             while true {
@@ -215,12 +271,24 @@ enum SlskZlib {
                     throw SlskError(message: "corrupt compressed data")
                 }
                 output.append(buffer, count: bufferSize - streamPointer.pointee.dst_size)
-                guard output.count <= SlskFrameBuffer.maxFrameSize else {
+                if output.count >= limit, stopsAtLimit {
+                    output = output.prefix(limit)
+                    break
+                }
+                guard output.count <= limit else {
                     throw SlskError(message: "decompressed payload too large")
                 }
                 if status == COMPRESSION_STATUS_END { break }
             }
         }
         return output
+    }
+}
+
+extension UInt64 {
+    /// `self + other`, stopping at `.max` instead of trapping (sizes peers report can be huge).
+    func saturatingAdd(_ other: UInt64) -> UInt64 {
+        let (sum, overflow) = addingReportingOverflow(other)
+        return overflow ? .max : sum
     }
 }

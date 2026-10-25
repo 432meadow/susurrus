@@ -37,15 +37,9 @@ enum Duplicates {
     }
 
     static func key(for track: Track) -> String? {
-        let title = normalize(track.title)
+        let title = TextKey.alphanumerics(track.title)
         guard !title.isEmpty else { return nil }
-        return normalize(track.displayArtist) + "\u{1}" + title
-    }
-
-    /// Lowercased letters and digits only, accents removed.
-    static func normalize(_ text: String) -> String {
-        let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
-        return String(String.UnicodeScalarView(folded.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }))
+        return TextKey.alphanumerics(track.displayArtist) + "\u{1}" + title
     }
 }
 
@@ -58,11 +52,15 @@ enum MissingFiles {
         case offline
     }
 
-    /// Checks each path; for files under /Volumes, an unmounted volume marks all of its files
-    /// offline with a single check instead of one per file.
-    static func check(_ paths: [(id: Int64, path: String)], fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> [Int64: Status] {
+    /// Checks each path. Over a network share every file system call is a round trip, so each
+    /// folder is listed once instead of asking for every file; an unmounted volume under /Volumes
+    /// marks all of its files offline with a single check.
+    static func check(_ paths: [(id: Int64, path: String)],
+                      listFolder: (String) -> [String]? = { try? FileManager.default.contentsOfDirectory(atPath: $0) },
+                      fileExists: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> [Int64: Status] {
         var volumeMounted: [String: Bool] = [:]
         var result: [Int64: Status] = [:]
+        var byFolder: [String: [(id: Int64, path: String)]] = [:]
         for (id, path) in paths {
             if let volume = volumeRoot(of: path) {
                 let mounted = volumeMounted[volume] ?? {
@@ -75,7 +73,19 @@ enum MissingFiles {
                     continue
                 }
             }
-            if !fileExists(path) { result[id] = .missing }
+            byFolder[(path as NSString).deletingLastPathComponent, default: []].append((id, path))
+        }
+        for (folder, files) in byFolder {
+            guard let names = listFolder(folder).map({ Set($0.map(\.precomposedStringWithCanonicalMapping)) }) else {
+                // A folder that's gone takes its files with it; one that can't be listed is asked file by file.
+                let folderExists = fileExists(folder)
+                for (id, path) in files where !folderExists || !fileExists(path) { result[id] = .missing }
+                continue
+            }
+            for (id, path) in files where !names.contains((path as NSString).lastPathComponent.precomposedStringWithCanonicalMapping) {
+                // Not listed under that name: maybe it's spelled with another case. Ask for the file itself.
+                if !fileExists(path) { result[id] = .missing }
+            }
         }
         return result
     }

@@ -10,15 +10,27 @@ enum Palette {
     static let coolNS = dynamic(dark: 0x6E8494, light: 0x5B7484)
     /// Soft warnings: waiting, failed-but-retryable.
     static let ochreNS = dynamic(dark: 0xB8925C, light: 0x9A7238)
+    /// Errors: a muted brick red.
+    static let errorNS = dynamic(dark: 0xD08070, light: 0xA94A3F)
+    /// Done and matched: a sage green.
+    static let successNS = dynamic(dark: 0x8DAF86, light: 0x557F4E)
 
     static let warm = Color(nsColor: warmNS)
     static let cool = Color(nsColor: coolNS)
     static let ochre = Color(nsColor: ochreNS)
+    static let error = Color(nsColor: errorNS)
+    static let success = Color(nsColor: successNS)
 
+    /// With Increase Contrast on, each colour moves further from the background: darker on light,
+    /// lighter on dark.
     private static func dynamic(dark: Int, light: Int) -> NSColor {
         NSColor(name: nil) { appearance in
-            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            return rgb(isDark ? dark : light)
+            switch appearance.bestMatch(from: [.aqua, .darkAqua, .accessibilityHighContrastAqua, .accessibilityHighContrastDarkAqua]) {
+            case .darkAqua?: rgb(dark)
+            case .accessibilityHighContrastDarkAqua?: rgb(dark).blended(withFraction: 0.35, of: .white) ?? rgb(dark)
+            case .accessibilityHighContrastAqua?: rgb(light).blended(withFraction: 0.35, of: .black) ?? rgb(light)
+            default: rgb(light)
+            }
         }
     }
 
@@ -48,6 +60,12 @@ final class PaletteRowView: NSTableRowView {
 
     /// The wash is light, so cells keep their normal ink rather than switching to white.
     override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
+
+    /// Cells that draw differently on a selected row (the rating stars) need a redraw when it changes,
+    /// since their background style stays the same.
+    override var isSelected: Bool {
+        didSet { if isSelected != oldValue { subviews.forEach { $0.needsDisplay = true } } }
+    }
 
     override func drawSelection(in dirtyRect: NSRect) {
         let rect = bounds.insetBy(dx: Self.inset, dy: 0)

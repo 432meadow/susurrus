@@ -18,19 +18,7 @@ struct AlbumGridView: View {
                         AlbumCell(album: album, isSelected: album.id == model.selectedAlbumID)
                             .onTapGesture(count: 2) { model.play(album) }
                             .simultaneousGesture(TapGesture().onEnded { model.selectedAlbumID = album.id })
-                            .contextMenu {
-                                Button("Play") { model.play(album) }
-                                if let artist = album.pageArtist {
-                                    Button("Go to Artist") { model.showArtist(artist) }
-                                }
-                                Button("Show in Finder") {
-                                    NSWorkspace.shared.activateFileViewerSelecting(album.tracks.map { URL(fileURLWithPath: $0.path) })
-                                }
-                                Divider()
-                                Button("Look Up Album on MusicBrainz…") { model.lookUpAlbum(for: album.tracks) }
-                                Button("Find Missing Cover") { model.findMissingCovers(for: [album]) }
-                                    .disabled(model.coverSearch != nil)
-                            }
+                            .contextMenu { MenuEntries(entries: TrackMenu.entries(for: album, model: model)) }
                     }
                 }
                 .padding(20)
@@ -83,7 +71,6 @@ struct AlbumCell: View {
 private struct AlbumTracksView: View {
     @Environment(AppModel.self) private var model
     let album: Album
-    @State private var selectedIDs = Set<Track.ID>()
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -98,32 +85,7 @@ private struct AlbumTracksView: View {
             }
             .frame(width: 180, alignment: .leading)
 
-            Table(album.tracks, selection: $selectedIDs) {
-                TableColumn("#") { track in
-                    Text(track.trackNumber > 0 ? "\(track.trackNumber)" : "").monospacedDigit().foregroundStyle(.secondary)
-                }
-                .width(28)
-                TableColumn("Title") { track in
-                    HStack(spacing: 4) {
-                        if model.player.currentTrack?.id == track.id {
-                            Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
-                        }
-                        Text(track.title)
-                    }
-                }
-                TableColumn("Artist") { Text($0.displayArtist) }
-                TableColumn("Time") { Text(Format.time($0.length)).monospacedDigit() }
-                    .width(52)
-                TableColumn("Rating") { RatingView(rating: $0.rating) }
-                    .width(72)
-            }
-            .id(album.id)
-            .contextMenu(forSelectionType: Track.ID.self) { _ in
-            } primaryAction: { ids in
-                if let index = album.tracks.firstIndex(where: { ids.contains($0.id) }) {
-                    model.play(album, startingAt: index)
-                }
-            }
+            AlbumTrackTable(album: album)
         }
         .frame(maxHeight: .infinity, alignment: .top)
         .padding(16)
@@ -135,5 +97,62 @@ private struct AlbumTracksView: View {
         parts.append("\(album.tracks.count) tracks")
         parts.append(Format.time(album.duration))
         return parts.joined(separator: " · ")
+    }
+}
+
+/// An album's tracks, on the Albums grid and on artist pages. The selection is the model's, so
+/// the Track menu and its shortcuts act on it; double-click plays the album from that track.
+struct AlbumTrackTable: View {
+    @Environment(AppModel.self) private var model
+    let album: Album
+
+    var body: some View {
+        @Bindable var model = model
+        let showsDiscs = Set(album.tracks.map(\.discNumber)).count > 1
+        let showsArtists = album.tracks.contains { $0.displayArtist != album.artist }
+        Table(album.tracks, selection: $model.selectedTrackIDs) {
+            TableColumn("#") { track in
+                Text(Self.number(of: track, withDisc: showsDiscs)).monospacedDigit().foregroundStyle(.secondary)
+            }
+            .width(showsDiscs ? 40 : 28)
+            TableColumn("Title") { track in
+                HStack(spacing: 4) {
+                    if model.player.currentTrack?.id == track.id {
+                        Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
+                            .accessibilityLabel("Now playing")
+                    }
+                    Text(track.displayTitle)
+                }
+            }
+            TableColumn("Artist") { track in
+                Text(showsArtists ? track.displayArtist : "").foregroundStyle(.secondary)
+            }
+            TableColumn("Time") { Text(Format.time($0.length)).monospacedDigit() }
+                .width(52)
+            TableColumn("Plays") { track in
+                Text(track.playCount > 0 ? "\(track.playCount)" : "").monospacedDigit().foregroundStyle(.secondary)
+            }
+            .width(44)
+            TableColumn("Rating") { RatingView(rating: $0.rating) }
+                .width(72)
+        }
+        .contextMenu(forSelectionType: Track.ID.self) { ids in
+            MenuEntries(entries: TrackMenu.entries(for: album.tracks.filter { ids.contains($0.id) }, model: model) { play(from: ids) })
+        } primaryAction: { ids in
+            play(from: ids)
+        }
+        .onChange(of: album.id) { model.selectedTrackIDs = [] }
+        .onDisappear { model.selectedTrackIDs = [] }
+    }
+
+    private func play(from ids: Set<Track.ID>) {
+        if let index = album.tracks.firstIndex(where: { ids.contains($0.id) }) {
+            model.play(album, startingAt: index)
+        }
+    }
+
+    private static func number(of track: Track, withDisc: Bool) -> String {
+        guard track.trackNumber > 0 else { return "" }
+        return withDisc && track.discNumber > 0 ? "\(track.discNumber)-\(track.trackNumber)" : "\(track.trackNumber)"
     }
 }

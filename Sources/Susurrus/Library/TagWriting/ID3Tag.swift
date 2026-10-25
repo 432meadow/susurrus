@@ -3,10 +3,11 @@ import Foundation
 /// ID3v2.2 / v2.3 / v2.4 tags at the start of MP3 files.
 ///
 /// Only the frames for edited fields are replaced. Every other frame (artwork, TXXX, iTunes'
-/// COMM frames, PRIV, …) is copied over with its original header and bytes. The tag keeps its
-/// version (v2.2 keeps its 3-letter frames); files without a tag get a new v2.3 one (the version
-/// most of the library uses and every player reads). ID3v1 and APE tags at the end of the file
-/// are left as they are.
+/// COMM frames, PRIV, …) is copied over with its original header and bytes, in order. An edited
+/// frame that changes size moves to the end, so changing it again doesn't shift other frames
+/// (such as the cover). The tag keeps its version (v2.2 keeps its 3-letter frames); files without
+/// a tag get a new v2.3 one (the version most of the library uses and every player reads). ID3v1
+/// and APE tags at the end of the file are left as they are.
 enum ID3Tag: TagFormat {
     struct Frame: Equatable {
         var id: String
@@ -139,13 +140,19 @@ enum ID3Tag: TagFormat {
         let version = parsed.version
         var frames = parsed.frames
 
+        // Replaces the frames `isOld` matches with `frame` (nil: removes them). A frame that keeps
+        // its size keeps its place, so nothing else moves; one that grows or shrinks goes last,
+        // before the padding, where changing it again moves nothing else either.
+        func put(_ frame: Frame?, replacing isOld: (Frame) -> Bool) {
+            let old = frames.indices.filter { isOld(frames[$0]) }
+            let sameSize = old.count == 1 && frames[old[0]].raw.count == frame?.raw.count
+            frames.removeAll(where: isOld)
+            guard let frame else { return }
+            frames.insert(frame, at: sameSize ? old[0] : frames.count)
+        }
         func replace(_ ids: [String], with body: [UInt8]?) {
             guard !ids.isEmpty else { return }
-            let index = frames.firstIndex { ids.contains($0.id) }
-            frames.removeAll { ids.contains($0.id) }
-            if let body {
-                frames.insert(makeFrame(ids[0], body: body, version: version), at: index ?? frames.count)
-            }
+            put(body.map { makeFrame(ids[0], body: $0, version: version) }, replacing: { ids.contains($0.id) })
         }
         func text(_ field: KeyPath<TagValues, String?>) {
             guard let value = values[keyPath: field] else { return }
@@ -184,12 +191,8 @@ enum ID3Tag: TagFormat {
             replace(ids(for: \TagValues.compilation, version: version), with: compilation ? textBody("1", version: version) : nil)
         }
         if let comment = values.comment {
-            let index = frames.firstIndex { isPlainComment($0) }
-            frames.removeAll { isPlainComment($0) }
-            if !comment.isEmpty {
-                frames.insert(makeFrame(name("COMM", version)!, body: commentBody(comment, version: version), version: version),
-                              at: index ?? frames.count)
-            }
+            put(comment.isEmpty ? nil : makeFrame(name("COMM", version)!, body: commentBody(comment, version: version), version: version),
+                replacing: isPlainComment)
         }
         if let rating = values.rating {
             let byte = POPMRating.byte(for: rating)
@@ -209,12 +212,8 @@ enum ID3Tag: TagFormat {
         }
 
         if let artwork = values.artwork {
-            let index = frames.firstIndex { isFrontCover($0) }
-            frames.removeAll { isFrontCover($0) }
-            if !artwork.data.isEmpty {
-                frames.insert(makeFrame(name("APIC", version)!, body: pictureBody(artwork, version: version), version: version),
-                              at: index ?? frames.count)
-            }
+            put(artwork.data.isEmpty ? nil : makeFrame(name("APIC", version)!, body: pictureBody(artwork, version: version), version: version),
+                replacing: isFrontCover)
         }
 
         let frameBytes = frames.flatMap(\.raw)

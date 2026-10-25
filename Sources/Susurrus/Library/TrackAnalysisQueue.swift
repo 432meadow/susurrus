@@ -2,7 +2,8 @@ import Foundation
 import Observation
 
 /// Background analysis (BPM or key detection), a few files at a time (each read is a short
-/// excerpt, but the files sit on a slow network share). Results are handed back in small batches
+/// excerpt, but the files sit on a slow network share). The reads run on `BlockingIO` threads, so
+/// a hung share can't stall the rest of the app's tasks. Results are handed back in small batches
 /// so the library and table update as it goes without re-sorting 50k rows per track.
 @MainActor
 @Observable
@@ -90,7 +91,8 @@ final class TrackAnalysisQueue<Value: Sendable> {
         let track = pending.removeFirst()
         let detect = detect
         group.addTask(priority: .utility) {
-            (track.id, try? detect(URL(fileURLWithPath: track.path)))
+            let url = URL(fileURLWithPath: track.path)
+            return (track.id, await BlockingIO.analysis.run { try? detect(url) })
         }
         return true
     }

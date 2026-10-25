@@ -46,8 +46,7 @@ struct ArtistIndex {
 
     /// Folds case, accents and width, and drops a leading "The ", so spellings of a name meet.
     static func key(for name: String) -> String {
-        var folded = name.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
-            .trimmingCharacters(in: .whitespaces)
+        var folded = TextKey.folded(name).trimmingCharacters(in: .whitespaces)
         if folded.hasPrefix("the ") { folded.removeFirst(4) }
         return folded
     }
@@ -58,13 +57,11 @@ enum DiscographyMatch {
     /// Folds a title for comparison: case, accents, punctuation, "&"/"and", and edition notes in
     /// brackets ("(Deluxe Edition)", "[Remastered 2011]") are all ignored.
     static func normalizedTitle(_ title: String) -> String {
-        var text = title.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        var text = TextKey.folded(title)
         // Drop bracketed notes, but keep the title if that's all it is.
         let withoutNotes = text.replacingOccurrences(of: #"\s*[\(\[][^\)\]]*[\)\]]"#, with: "", options: .regularExpression)
         if !withoutNotes.trimmingCharacters(in: .whitespaces).isEmpty { text = withoutNotes }
-        text = text.replacingOccurrences(of: "&", with: " and ")
-        let kept = text.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) ? Character($0) : " " }
-        return String(kept).split(separator: " ").joined(separator: " ")
+        return TextKey.words(text.replacingOccurrences(of: "&", with: " and "))
     }
 
     /// The library album (by its normalized title) that a release group is, if any: the same

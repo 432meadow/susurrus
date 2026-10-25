@@ -99,27 +99,50 @@ private struct LibrarySettings: View {
                 Text(total == 0 ? "Looking for new files…" : "Reading \(done.formatted()) of \(total.formatted()) new files…")
                     .font(.caption)
             }
-        case .finished(let added):
-            Text(added == 0 ? "No new files found." : "Added \(added.formatted()) tracks.")
+        case .finished(let added, let updated):
+            Text(Self.scanSummary(added: added, updated: updated))
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    static func scanSummary(added: Int, updated: Int) -> String {
+        switch (added, updated) {
+        case (0, 0): "No new or changed files found."
+        case (_, 0): "Added \(added.formatted()) \(added == 1 ? "track" : "tracks")."
+        case (0, _): "Updated \(updated.formatted()) changed \(updated == 1 ? "file" : "files")."
+        default: "Added \(added.formatted()) \(added == 1 ? "track" : "tracks"), updated \(updated.formatted()) changed \(updated == 1 ? "file" : "files")."
         }
     }
 }
 
 private struct SoulseekSettings: View {
     @Environment(AppModel.self) private var model
+    /// The account fields are edited here and saved together (Return or Save), so typing doesn't
+    /// reconnect on every keystroke.
+    @State private var usernameDraft = ""
+    @State private var passwordDraft = ""
+    @State private var isConfirmingReconnect = false
 
     var body: some View {
         @Bindable var soulseek = model.soulseek
         Form {
             Section("Account") {
-                TextField("Username", text: $soulseek.username)
+                TextField("Username", text: $usernameDraft)
                     .autocorrectionDisabled()
-                SecureField("Password", text: $soulseek.password)
-                Text("The password is kept in your keychain. A username nobody has used before is registered on the Soulseek network the first time it connects — pick a throwaway password either way.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .onSubmit(saveAccount)
+                SecureField("Password", text: $passwordDraft)
+                    .onSubmit(saveAccount)
+                HStack(alignment: .firstTextBaseline) {
+                    Text(accountChanged
+                        ? "Press Return or Save to use the new details."
+                        : "The password is kept in your keychain. A username nobody has used before is registered on the Soulseek network the first time it connects — pick a throwaway password either way.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Save", action: saveAccount)
+                        .disabled(!accountChanged)
+                }
             }
             Section("Messages and User Info") {
                 LabeledContent("Description") {
@@ -167,14 +190,14 @@ private struct SoulseekSettings: View {
                     }
                 }
                 HStack {
-                    if soulseek.shareState == .scanning { ProgressView().controlSize(.small) }
+                    if soulseek.shareState == .scanning || soulseek.isWalkingShare { ProgressView().controlSize(.small) }
                     Text(soulseek.shareStatusText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Rescan") { soulseek.rescanShares() }
+                    Button("Rescan") { soulseek.rescanShares(walk: true) }
                         .controlSize(.small)
-                        .disabled(soulseek.sharedFolderPath.isEmpty || soulseek.shareState == .scanning)
+                        .disabled(soulseek.sharedFolderPath.isEmpty || soulseek.shareState == .scanning || soulseek.isWalkingShare)
                 }
                 Text("Other users can search this folder and download from it. Sharing back is what keeps Soulseek alive — many users only upload to people who share.")
                     .font(.caption)
@@ -234,6 +257,37 @@ private struct SoulseekSettings: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            usernameDraft = soulseek.username
+            passwordDraft = soulseek.password
+        }
+        .alert("Reconnect as \(usernameDraft.trimmingCharacters(in: .whitespacesAndNewlines))?", isPresented: $isConfirmingReconnect) {
+            Button("Reconnect") { commitAccount() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            let count = soulseek.activeTransferCount
+            Text("Changing the account reconnects to Soulseek, which stops \(count == 1 ? "the transfer" : "\(count.formatted()) transfers") in progress.")
+        }
+    }
+
+    private var accountChanged: Bool {
+        usernameDraft.trimmingCharacters(in: .whitespacesAndNewlines) != model.soulseek.username
+            || passwordDraft != model.soulseek.password
+    }
+
+    /// Saves the account fields, asking first when that would cut off transfers.
+    private func saveAccount() {
+        guard accountChanged else { return }
+        if model.soulseek.isOnline, model.soulseek.activeTransferCount > 0 {
+            isConfirmingReconnect = true
+        } else {
+            commitAccount()
+        }
+    }
+
+    private func commitAccount() {
+        model.soulseek.setCredentials(username: usernameDraft, password: passwordDraft)
+        usernameDraft = model.soulseek.username
     }
 
     private func chooseDownloadFolder() {
@@ -244,8 +298,11 @@ private struct SoulseekSettings: View {
         panel.prompt = "Use"
         panel.message = "Soulseek downloads will be saved in this folder."
         panel.directoryURL = URL(fileURLWithPath: model.soulseek.downloadFolderPath)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        model.soulseek.downloadFolderPath = url.path
+        // Not modal: the rest of the app (the mixer, say) keeps working while it's open.
+        panel.begin { [soulseek = model.soulseek] response in
+            guard response == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated { soulseek.downloadFolderPath = url.path }
+        }
     }
 }
 
@@ -310,7 +367,7 @@ private struct PlaybackSettings: View {
             LabeledContent("Equalizer") {
                 Button("Show Equalizer…") { openWindow(id: "equalizer") }
             }
-            Text("Tracks on network volumes are copied to a small local cache before playing, so network hiccups can't interrupt playback. The next track is fetched while the current one plays, for gapless transitions.")
+            Text("Tracks on a network share play straight from it, except FLAC, which is copied to a small local cache first (it has to be read end to end). The next track is copied ahead while the current one plays, for gapless transitions.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreAudio
 import Foundation
 import Observation
@@ -79,5 +80,25 @@ final class OutputDevices {
         var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
         guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr, let value else { return nil }
         return value.takeRetainedValue() as String
+    }
+}
+
+/// What the queue player's and the mixer's engines share about their output.
+extension AVAudioEngine {
+    /// Plays through `device` instead of the system output.
+    func setOutputDevice(_ device: AudioDeviceID) {
+        guard let unit = outputNode.audioUnit else { return }
+        var device = device
+        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                             &device, UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
+    /// Calls `handler` whenever the output device or its format changes (headphones unplugged, an
+    /// AirPlay or Bluetooth switch, a new sample rate). The engine has stopped itself by then, and
+    /// its nodes' clocks have stopped with it.
+    func onConfigurationChange(_ handler: @escaping @MainActor @Sendable () -> Void) {
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: self, queue: .main) { _ in
+            MainActor.assumeIsolated { handler() }
+        }
     }
 }

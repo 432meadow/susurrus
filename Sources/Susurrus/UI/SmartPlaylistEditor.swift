@@ -32,7 +32,7 @@ struct SmartPlaylistEditor: View {
                 .frame(minHeight: 180)
             HStack {
                 if let error {
-                    Text(error).foregroundStyle(.red).font(.caption)
+                    Text(error).foregroundStyle(Palette.error).font(.caption)
                 } else if let matchCount {
                     Text("\(matchCount.formatted()) matching tracks").foregroundStyle(.secondary).font(.caption)
                 } else {
@@ -60,7 +60,7 @@ struct SmartPlaylistEditor: View {
         try? await Task.sleep(for: .milliseconds(250))  // debounce while editing
         guard !Task.isCancelled else { return }
         let predicate = draft.predicate
-        let tracks = model.tracks
+        let tracks = model.detachedTracks()
         let result = await Task.detached(priority: .userInitiated) {
             Result { try SmartPredicate.evaluate(predicate, on: tracks).count }
         }.value

@@ -391,14 +391,8 @@ private struct ArtistPage: View {
                     .onTapGesture(count: 2) { model.play(album) }
                     .simultaneousGesture(TapGesture().onEnded { openAlbumID = album.id })
                     .contextMenu {
-                        Button("Open") { openAlbumID = album.id }
-                        Button("Play") { model.play(album) }
-                        Button("Play Next") { model.player.playNext(album.tracks) }
-                        Button("Add to Queue") { model.player.addToQueue(album.tracks) }
-                        Divider()
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting(album.tracks.map { URL(fileURLWithPath: $0.path) })
-                        }
+                        MenuEntries(entries: TrackMenu.entries(for: album, model: model,
+                                                               leading: [.action("Open") { openAlbumID = album.id }, .separator]))
                     }
                     .help("Click to see the tracks, double-click to play")
                 }
@@ -422,12 +416,19 @@ private struct ArtistPage: View {
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     }
                     .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { model.player.play(Array(top), startingAt: top.firstIndex(of: track).map { $0 - top.startIndex } ?? 0) }
+                    .onTapGesture(count: 2) { playMostPlayed(Array(top), from: track) }
+                    .contextMenu {
+                        MenuEntries(entries: TrackMenu.entries(for: [track], model: model) { playMostPlayed(Array(top), from: track) })
+                    }
                     .help("Double-click to play")
                 }
             }
             .frame(maxWidth: 640, alignment: .leading)
         }
+    }
+
+    private func playMostPlayed(_ tracks: [Track], from track: Track) {
+        model.player.play(tracks, startingAt: tracks.firstIndex(of: track) ?? 0)
     }
 
     // MARK: Discography
@@ -527,15 +528,6 @@ private struct ArtistAlbumPage: View {
     let album: Album
     let artistName: String
     let onBack: () -> Void
-    @State private var selectedIDs = Set<Track.ID>()
-
-    private var showsTrackArtists: Bool {
-        album.tracks.contains { $0.displayArtist != album.artist }
-    }
-
-    private var showsDiscs: Bool {
-        Set(album.tracks.map(\.discNumber)).count > 1
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -570,66 +562,15 @@ private struct ArtistAlbumPage: View {
                 }
             }
 
-            Table(album.tracks, selection: $selectedIDs) {
-                TableColumn("#") { track in
-                    Text(trackNumber(track)).monospacedDigit().foregroundStyle(.secondary)
-                }
-                .width(showsDiscs ? 40 : 28)
-                TableColumn("Title") { track in
-                    HStack(spacing: 4) {
-                        if model.player.currentTrack?.id == track.id {
-                            Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
-                        }
-                        Text(track.title)
-                    }
-                }
-                TableColumn("Artist") { track in
-                    Text(showsTrackArtists ? track.displayArtist : "").foregroundStyle(.secondary)
-                }
-                TableColumn("Time") { Text(Format.time($0.length)).monospacedDigit() }
-                    .width(52)
-                TableColumn("Plays") { track in
-                    Text(track.playCount > 0 ? "\(track.playCount)" : "").monospacedDigit().foregroundStyle(.secondary)
-                }
-                .width(44)
-                TableColumn("Rating") { RatingView(rating: $0.rating) }
-                    .width(72)
-            }
-            .contextMenu(forSelectionType: Track.ID.self) { ids in
-                let tracks = album.tracks.filter { ids.contains($0.id) }
-                if !tracks.isEmpty {
-                    Button("Play") { play(from: ids) }
-                    Button("Play Next") { model.playNext(tracks) }
-                    Button("Add to Queue") { model.addToQueue(tracks) }
-                    Divider()
-                    Button("Get Info") { model.showInfo(for: tracks) }
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting(tracks.map { URL(fileURLWithPath: $0.path) })
-                    }
-                }
-            } primaryAction: { ids in
-                play(from: ids)
-            }
+            AlbumTrackTable(album: album)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
-    private func play(from ids: Set<Track.ID>) {
-        if let index = album.tracks.firstIndex(where: { ids.contains($0.id) }) {
-            model.play(album, startingAt: index)
-        }
-    }
-
+    /// Plays the album in random order, leaving the player's own Shuffle setting alone.
     private func shuffle() {
-        guard !album.tracks.isEmpty else { return }
-        model.player.setShuffle(true)
-        model.player.play(album.tracks, startingAt: Int.random(in: album.tracks.indices))
-    }
-
-    private func trackNumber(_ track: Track) -> String {
-        guard track.trackNumber > 0 else { return "" }
-        return showsDiscs && track.discNumber > 0 ? "\(track.discNumber)-\(track.trackNumber)" : "\(track.trackNumber)"
+        model.player.play(album.tracks.shuffled(), startingAt: 0)
     }
 
     private var details: String {

@@ -96,12 +96,21 @@ import Testing
         try write(Self.drums(bpm: 96, seconds: 70), to: url, settings: [
             AVFormatIDKey: kAudioFormatFLAC, AVSampleRateKey: 44100, AVNumberOfChannelsKey: 2,
         ])
+        func fragments() -> Set<String> {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)) ?? []
+            return Set(names.filter { $0.hasPrefix("susurrus-bpm-") })
+        }
+        let before = fragments()
         let excerpt = try BPMDetector.readExcerpt(url)
         #expect(abs(Double(excerpt.samples.count) / excerpt.sampleRate - 30) < 0.01)
         #expect(abs(try #require(BPMDetector.tempo(of: excerpt)) - 96) < 1)
-        // Its temp file is gone again.
-        let leftovers = try FileManager.default.contentsOfDirectory(atPath: FileManager.default.temporaryDirectory.path)
-        #expect(!leftovers.contains { $0.hasPrefix("susurrus-bpm-") })
+        // Its temp file is gone again. Other test runs on the Mac share the temp folder, so one of
+        // theirs may be there for a moment; a leaked one would stay.
+        let deadline = Date().addingTimeInterval(10)
+        while !fragments().subtracting(before).isEmpty, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(fragments().subtracting(before).isEmpty)
     }
 
     @Test func findsFLACFrameHeadersByTheirChecksum() {

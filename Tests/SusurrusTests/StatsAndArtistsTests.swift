@@ -190,7 +190,10 @@ import Testing
 
     @Test func upgradingFromVersion2AddsTheListenLog() throws {
         try store.recordPlay(trackID: ids[0], at: Date(timeIntervalSince1970: 50))
-        try store.db.execute("DROP TABLE listen; DROP TABLE artist_link; ALTER TABLE track DROP COLUMN musical_key; PRAGMA user_version = 2;")
+        try store.db.execute("""
+            DROP TABLE listen; DROP TABLE artist_link; DROP TABLE unreadable_file;
+            ALTER TABLE track DROP COLUMN musical_key; ALTER TABLE track DROP COLUMN file_mtime; PRAGMA user_version = 2;
+            """)
         let reopened = try LibraryStore(url: url)
         #expect(try reopened.listens(since: nil).isEmpty)
         #expect(try reopened.plays(since: nil).map(\.trackID) == [ids[0]], "history is kept")

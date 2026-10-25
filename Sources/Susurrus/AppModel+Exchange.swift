@@ -10,7 +10,17 @@ final class PlaylistExchange {
     var rekordboxDraft: RekordboxExportDraft?
     /// What's being worked on, for the window subtitle ("Importing library…").
     var status: String?
+    /// A Library.xml import waiting for the go-ahead in its preview sheet.
+    var libraryImport: PendingLibraryImport?
     @ObservationIgnored let beatGrids = BeatGridCache()
+}
+
+/// A Library.xml import that's been read and planned, waiting for the go-ahead.
+struct PendingLibraryImport: Identifiable {
+    let id = UUID()
+    let fileName: String
+    let library: ITunesLibrary
+    let plan: LibraryImportPlan
 }
 
 struct RekordboxExportDraft: Identifiable {
@@ -47,17 +57,24 @@ extension AppModel {
         let saved = UserDefaults.standard.string(forKey: Self.m3uPathStyleKey).flatMap(M3UPlaylist.PathStyle.init) ?? .relative
         popup.selectItem(at: styles.firstIndex(of: saved) ?? 0)
         panel.accessoryView = Self.accessory(label: "Paths:", control: popup)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let style = styles[max(0, popup.indexOfSelectedItem)]
-        UserDefaults.standard.set(style.rawValue, forKey: Self.m3uPathStyleKey)
+        // Not modal: the rest of the app (the mixer, say) keeps working while it's open.
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            let style = styles[max(0, popup.indexOfSelectedItem)]
+            UserDefaults.standard.set(style.rawValue, forKey: Self.m3uPathStyleKey)
+            MainActor.assumeIsolated { self?.exportPlaylist(playlist, to: url, style: style) }
+        }
+    }
 
+    private func exportPlaylist(_ playlist: Playlist, to url: URL, style: M3UPlaylist.PathStyle) {
         Task {
-            let entries = await tracks(inPlaylist: id).map(M3UPlaylist.entry)
+            let entries = await tracks(inPlaylist: playlist.id).map(M3UPlaylist.entry)
             let text = M3UPlaylist.text(for: entries, style: style, directory: url.deletingLastPathComponent().path)
             do {
-                try ExchangeFile.write(Data(text.utf8), to: url)
+                try await BlockingIO.library.run { Result { try ExchangeFile.write(Data(text.utf8), to: url) } }.get()
+                notify("Exported “\(playlist.name)”", "\(Self.count(entries.count, "entry", "entries")) in \(url.lastPathComponent)")
             } catch {
-                Self.showError("Couldn't export “\(playlist.name)”", error)
+                report("Couldn't export “\(playlist.name)”", error)
             }
         }
     }
@@ -71,8 +88,11 @@ extension AppModel {
         panel.allowsMultipleSelection = true
         panel.prompt = "Import"
         panel.message = "Choose M3U playlists to import. Files they list that aren't in the library yet are added."
-        guard panel.runModal() == .OK else { return }
-        importM3U(panel.urls, into: folderID)
+        panel.begin { [weak self] response in
+            guard response == .OK else { return }
+            let urls = panel.urls
+            MainActor.assumeIsolated { self?.importM3U(urls, into: folderID) }
+        }
     }
 
     func importM3U(_ urls: [URL], into folderID: Int64? = nil) {
@@ -84,10 +104,8 @@ extension AppModel {
                 reports.append(await importPlaylist(at: url, into: folderID))
             }
             exchange.status = nil
-            let alert = NSAlert()
-            alert.messageText = urls.count == 1 ? "Imported “\(urls[0].deletingPathExtension().lastPathComponent)”" : "Imported \(urls.count) playlists"
-            alert.informativeText = reports.joined(separator: "\n\n")
-            alert.runModal()
+            notify(urls.count == 1 ? "Imported “\(urls[0].deletingPathExtension().lastPathComponent)”" : "Imported \(urls.count) playlists",
+                   reports.joined(separator: "\n\n"), staysOpen: true)
         }
     }
 
@@ -95,17 +113,19 @@ extension AppModel {
     /// the library are added first. Returns the summary line for the alert.
     func importPlaylist(at url: URL, into folderID: Int64?) async -> String {
         let name = url.deletingPathExtension().lastPathComponent
-        guard let data = try? Data(contentsOf: url), let text = M3UPlaylist.decode(data) else {
+        guard let data = await BlockingIO.library.run({ try? Data(contentsOf: url) }), let text = M3UPlaylist.decode(data) else {
             return "“\(name)” couldn't be read."
         }
         let entries = M3UPlaylist.parse(text, directory: url.deletingLastPathComponent().path)
         var matcher = TrackPathMatcher(tracks)
         let unmatched = Array(Set(entries.map(\.path).filter { matcher.trackID(forPath: $0) == nil }))
         let matched = entries.filter { matcher.trackID(forPath: $0.path) != nil }.count
-        let addable = await Task.detached(priority: .userInitiated) {
+        let addable = await BlockingIO.library.run {
             unmatched.filter { FileManager.default.fileExists(atPath: $0) && TagReader.isAudioFile(URL(fileURLWithPath: $0)) }
-        }.value
-        if await addFilesToLibrary(addable) > 0 { matcher = TrackPathMatcher(tracks) }
+        }
+        if !addable.isEmpty, await !addToLibrary(addable.map { URL(fileURLWithPath: $0) }).value.added.isEmpty {
+            matcher = TrackPathMatcher(tracks)
+        }
 
         let ids = entries.compactMap { matcher.trackID(forPath: $0.path) }
         let missing = entries.filter { matcher.trackID(forPath: $0.path) == nil }
@@ -119,27 +139,6 @@ extension AppModel {
         return lines.joined(separator: "\n")
     }
 
-    /// Reads the tags of files not in the library yet (a few at a time, like Add to Library) and
-    /// adds them. Returns how many were added.
-    func addFilesToLibrary(_ paths: [String]) async -> Int {
-        guard let store, !paths.isEmpty else { return 0 }
-        var scanned: [ScannedTrack] = []
-        await withTaskGroup(of: ScannedTrack?.self) { group in
-            var iterator = paths.makeIterator()
-            for _ in 0..<6 {
-                guard let path = iterator.next() else { break }
-                group.addTask { await TagReader.read(URL(fileURLWithPath: path)) }
-            }
-            for await result in group {
-                if let result { scanned.append(result) }
-                if let path = iterator.next() { group.addTask { await TagReader.read(URL(fileURLWithPath: path)) } }
-            }
-        }
-        let added = (try? store.insert(scanned)) ?? 0
-        if added > 0 { try? reload() }
-        return added
-    }
-
     // MARK: Apple Music / iTunes library import
 
     func chooseLibraryXMLToImport() {
@@ -147,46 +146,59 @@ extension AppModel {
         panel.allowedContentTypes = [.xml]
         panel.prompt = "Import"
         panel.message = "Choose a library exported from Music or iTunes (File ▸ Library ▸ Export Library…)."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        importLibraryXML(url)
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated { self?.importLibraryXML(url) }
+        }
     }
 
-    /// Reads the export, shows what would change, and on confirmation applies it as one undoable step.
+    /// Reads the export and plans the import; the preview sheet (`exchange.libraryImport`) shows
+    /// what would change, and `confirmLibraryImport` applies it as one undoable step.
     func importLibraryXML(_ url: URL) {
-        guard store != nil, exchange.status == nil else { return }
+        guard store != nil, exchange.status == nil, exchange.libraryImport == nil else { return }
         exchange.status = "Reading “\(url.lastPathComponent)”…"
+        let all = detachedTracks()
         Task {
-            defer { exchange.status = nil }
-            let all = tracks
             let prepared = await Task.detached(priority: .userInitiated) { () -> Result<(ITunesLibrary, LibraryImportPlan), Error> in
                 Result {
                     let library = try ITunesLibrary(data: try Data(contentsOf: url))
                     return (library, LibraryImportPlan(library: library, tracks: all, fileExists: FileManager.default.fileExists))
                 }
             }.value
-            guard case .success(let (library, plan)) = prepared else {
-                if case .failure(let error) = prepared { Self.showError("Couldn't import “\(url.lastPathComponent)”", error) }
-                return
+            exchange.status = nil
+            switch prepared {
+            case .success(let (library, plan)):
+                exchange.libraryImport = PendingLibraryImport(fileName: url.lastPathComponent, library: library, plan: plan)
+            case .failure(let error):
+                report("Couldn't import “\(url.lastPathComponent)”", error)
             }
-            guard let addFiles = confirmLibraryImport(plan, fileName: url.lastPathComponent) else { return }
-
-            var final = plan
-            if addFiles, !plan.addablePaths.isEmpty {
-                exchange.status = "Adding \(Self.count(plan.addablePaths.count, "file", "files"))…"
-                if await addFilesToLibrary(plan.addablePaths) > 0 {
-                    let all = tracks
-                    final = await Task.detached(priority: .userInitiated) {
-                        LibraryImportPlan(library: library, tracks: all, fileExists: { _ in false })
-                    }.value
-                }
-            }
-            applyLibraryImport(library, plan: final)
         }
     }
 
-    /// The preview: counts of what would change. Returns whether to add the files on disk that
-    /// aren't in the library, or nil when cancelled.
-    private func confirmLibraryImport(_ plan: LibraryImportPlan, fileName: String) -> Bool? {
+    /// Goes ahead with the import in the preview sheet, first adding the files that are on disk
+    /// but not in the library when `addFiles`.
+    func confirmLibraryImport(addFiles: Bool) {
+        guard let pending = exchange.libraryImport else { return }
+        exchange.libraryImport = nil
+        Task {
+            var plan = pending.plan
+            if addFiles, !plan.addablePaths.isEmpty {
+                exchange.status = "Adding \(Self.count(plan.addablePaths.count, "file", "files"))…"
+                let scan = await addToLibrary(plan.addablePaths.map { URL(fileURLWithPath: $0) }).value
+                if !scan.added.isEmpty {
+                    let all = detachedTracks()
+                    plan = await Task.detached(priority: .userInitiated) {
+                        LibraryImportPlan(library: pending.library, tracks: all, fileExists: { _ in false })
+                    }.value
+                }
+                exchange.status = nil
+            }
+            applyLibraryImport(pending.library, plan: plan)
+        }
+    }
+
+    /// The preview's lines: counts of what would change.
+    static func importSummary(of plan: LibraryImportPlan) -> [String] {
         let total = plan.matchedCount + plan.addablePaths.count + plan.missingCount
         var lines = ["\(plan.matchedCount.formatted()) of \(Self.count(total, "track", "tracks")) are in the library"
                      + (plan.addablePaths.isEmpty ? "" : "; \(plan.addablePaths.count.formatted()) more are on disk but not in it")
@@ -206,23 +218,7 @@ extension AppModel {
         }
         lines.append("")
         lines.append("Saved to susurrus's database only, not written into the files. Edit ▸ Undo puts everything back.")
-
-        let alert = NSAlert()
-        alert.messageText = "Import “\(fileName)”?"
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.addButton(withTitle: "Import")
-        alert.addButton(withTitle: "Cancel")
-        var checkbox: NSButton?
-        if !plan.addablePaths.isEmpty {
-            let button = NSButton(checkboxWithTitle: "Add the \(Self.count(plan.addablePaths.count, "file", "files")) that aren't in the library (reads their tags)",
-                                  target: nil, action: nil)
-            button.state = .on
-            button.sizeToFit()
-            alert.accessoryView = button
-            checkbox = button
-        }
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        return checkbox?.state == .on
+        return lines
     }
 
     static let importFolderName = "Apple Music"
@@ -249,8 +245,9 @@ extension AppModel {
         }
         setImportedValues(values, actionName: actionName)
 
-        guard !library.playlists.isEmpty else { return }
-        guard let folderID = try? store.createPlaylist(named: Self.importFolderName, kind: .folder) else { return }
+        guard !library.playlists.isEmpty,
+              let folderID = perform("Couldn't create the imported playlists", { try $0.createPlaylist(named: Self.importFolderName, kind: .folder) })
+        else { return }
         defer {
             reloadPlaylists()
             registerUndo(actionName) { $0.deletePlaylist($0.resolvedPlaylistID(folderID), actionName: actionName) }
@@ -266,20 +263,15 @@ extension AppModel {
                 if let key = playlist.persistentID { created[key] = id }
             }
         } catch {
-            Self.showError("Couldn't create the imported playlists", error)
+            report("Couldn't create the imported playlists", error)
         }
     }
 
     /// Saves imported values; undoing calls this again with the values they replaced.
     func setImportedValues(_ values: [ImportedTrackValues], actionName: String) {
-        guard let store, !values.isEmpty else { return }
+        guard !values.isEmpty else { return }
         let old = values.compactMap { tracksByID[$0.trackID].map(ImportedTrackValues.init) }
-        do {
-            try store.setImportedValues(values)
-        } catch {
-            Self.showError("Couldn't save the imported values", error)
-            return
-        }
+        guard perform("Couldn't save the imported values", { try $0.setImportedValues(values) }) != nil else { return }
         for value in values { tracksByID[value.trackID].map(value.apply) }
         noteTracksChanged()
         if selection == .recentlyAdded || selection == .recentlyPlayed { loadSelection() } else { refreshVisible() }
@@ -300,8 +292,13 @@ extension AppModel {
         panel.allowedContentTypes = [.xml]
         panel.nameFieldStringValue = "rekordbox.xml"
         panel.message = "Import it in Rekordbox under Preferences ▸ Advanced ▸ rekordbox xml."
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated { self?.exportRekordboxXML(choosing: chosen, to: url) }
+        }
+    }
 
+    private func exportRekordboxXML(choosing chosen: Set<Int64>?, to url: URL) {
         exchange.status = "Exporting for Rekordbox…"
         Task {
             defer { exchange.status = nil }
@@ -323,11 +320,17 @@ extension AppModel {
                 exported = nodes.flatMap(collect).compactMap { tracksByID[$0] }
             }
             let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "development build"
-            let xml = RekordboxXML.document(tracks: exported, beatGrids: exchange.beatGrids.all, playlists: nodes, version: version)
-            do {
-                try ExchangeFile.write(Data(xml.utf8), to: url)
-            } catch {
-                Self.showError("Couldn't export for Rekordbox", error)
+            // The whole library is a big document: build and write it off the main thread, from copies.
+            let (copies, grids, playlists) = (exported.map { $0.snapshot() }, exchange.beatGrids.all, nodes)
+            let written = await Task.detached(priority: .userInitiated) {
+                Result {
+                    let xml = RekordboxXML.document(tracks: copies, beatGrids: grids, playlists: playlists, version: version)
+                    try ExchangeFile.write(Data(xml.utf8), to: url)
+                }
+            }.value
+            switch written {
+            case .success: notify("Exported for Rekordbox", "\(Self.count(copies.count, "track", "tracks")) in \(url.lastPathComponent)")
+            case .failure(let error): report("Couldn't export for Rekordbox", error)
             }
         }
     }
@@ -382,16 +385,7 @@ extension AppModel {
 
     // MARK: Helpers
 
-    private static func showError(_ message: String, _ error: Error) {
-        EventLog.shared.log("\(message): \(error.localizedDescription)")
-        let alert = NSAlert()
-        alert.messageText = message
-        alert.informativeText = error.localizedDescription
-        alert.alertStyle = .warning
-        alert.runModal()
-    }
-
-    private static func count(_ value: Int, _ singular: String, _ plural: String) -> String {
+    static func count(_ value: Int, _ singular: String, _ plural: String) -> String {
         "\(value.formatted()) \(value == 1 ? singular : plural)"
     }
 

@@ -2,7 +2,7 @@ import Foundation
 
 /// The app's own library database.
 final class LibraryStore {
-    static let schemaVersion = 4
+    static let schemaVersion = 5
 
     static var defaultURL: URL {
         supportDirectory.appendingPathComponent("susurrus/Library.sqlite")
@@ -41,6 +41,7 @@ final class LibraryStore {
             if current < 2 { try upgradeToVersion2(db) }
             if current < 3 { try upgradeToVersion3(db) }
             if current < 4 { try upgradeToVersion4(db) }
+            if current < 5 { try upgradeToVersion5(db) }
             try db.execute("PRAGMA user_version = \(schemaVersion)")
         }
     }
@@ -153,51 +154,47 @@ final class LibraryStore {
         try db.execute("ALTER TABLE track ADD COLUMN musical_key TEXT NOT NULL DEFAULT ''")
     }
 
-    func loadTracks() throws -> [Track] {
-        let statement = try db.prepare("""
-            SELECT id, title, artist, album, album_artist, genre, composer, grouping, comment,
-                   year, track_number, track_count, disc_number, disc_count, duration,
-                   bit_rate, sample_rate, bit_depth, channels, bpm, file_size, compilation, enabled,
-                   rating, play_count, date_added, last_played, date_modified, date_created, path, musical_key
-            FROM track
+    /// Version 5: each file's modification date as of when its tags were last read, so a rescan can
+    /// tell when another app changed it, and the files that couldn't be read, so rescans don't
+    /// keep opening them.
+    private static func upgradeToVersion5(_ db: Database) throws {
+        try db.execute("""
+            ALTER TABLE track ADD COLUMN file_mtime REAL;  -- Unix time; NULL until a rescan notes it
+            CREATE TABLE unreadable_file (
+                path TEXT PRIMARY KEY,
+                file_mtime REAL,
+                file_size INTEGER NOT NULL
+            );
             """)
-        func date(_ column: Int32) -> Date? {
-            statement.double(column).map { Date(timeIntervalSince1970: $0) }
-        }
+    }
 
+    func loadTracks() throws -> [Track] {
+        try loadTracks(where: nil, [])
+    }
+
+    /// The tracks with these IDs (ones no longer in the library are left out).
+    func loadTracks(ids: some Collection<Int64>) throws -> [Track] {
+        var tracks: [Track] = []
+        let ids = Array(ids)
+        for start in stride(from: 0, to: ids.count, by: 500) {
+            let chunk = ids[start ..< min(start + 500, ids.count)]
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ", ")
+            tracks += try loadTracks(where: "id IN (\(placeholders))", chunk.map { $0 as Any? })
+        }
+        return tracks
+    }
+
+    private func loadTracks(where condition: String?, _ values: [Any?]) throws -> [Track] {
+        let columns = Track.columns
+        let statement = try db.prepare("SELECT id, \(columns.map(\.name).joined(separator: ", ")) FROM track"
+            + (condition.map { " WHERE \($0)" } ?? ""))
+        try statement.bind(values)
         var tracks: [Track] = []
         while try statement.step() {
             let track = Track(id: statement.int(0)!)
-            track.title = statement.string(1) ?? ""
-            track.artist = statement.string(2) ?? ""
-            track.album = statement.string(3) ?? ""
-            track.albumArtist = statement.string(4) ?? ""
-            track.genre = statement.string(5) ?? ""
-            track.composer = statement.string(6) ?? ""
-            track.grouping = statement.string(7) ?? ""
-            track.comment = statement.string(8) ?? ""
-            track.year = Int(statement.int(9) ?? 0)
-            track.trackNumber = Int(statement.int(10) ?? 0)
-            track.totalNumberOfTracks = Int(statement.int(11) ?? 0)
-            track.discNumber = Int(statement.int(12) ?? 0)
-            track.totalNumberOfDiscs = Int(statement.int(13) ?? 0)
-            track.length = statement.double(14) ?? 0
-            track.bitRate = Int(statement.int(15) ?? 0)
-            track.sampleRate = Int(statement.int(16) ?? 0)
-            track.bitDepth = Int(statement.int(17) ?? 0)
-            track.channels = Int(statement.int(18) ?? 0)
-            track.bpm = Int(statement.int(19) ?? 0)
-            track.fileSize = statement.int(20) ?? 0
-            track.compilation = (statement.int(21) ?? 0) != 0
-            track.enabled = (statement.int(22) ?? 1) != 0
-            track.rating = statement.double(23) ?? 0
-            track.playCount = Int(statement.int(24) ?? 0)
-            track.dateAdded = date(25)
-            track.lastPlayed = date(26)
-            track.dateModified = date(27)
-            track.dateCreated = date(28)
-            track.path = statement.string(29) ?? ""
-            track.musicalKey = statement.string(30) ?? ""
+            for (index, column) in columns.enumerated() {
+                column.load(statement, Int32(index + 1), track)
+            }
             tracks.append(track)
         }
         return tracks
@@ -252,13 +249,69 @@ final class LibraryStore {
         return try statement.step() ? statement.data(0) : nil
     }
 
-    /// Called when a bookmark resolved to a new location, so the next lookup is direct.
-    func updateFileSize(_ size: Int64, forPath path: String) throws {
-        try db.prepare("UPDATE track SET file_size = ? WHERE path = ?").run([size, path])
+    /// After susurrus rewrote a file's tags: its new size, and its modification date forgotten, so
+    /// the next rescan takes the file as it is now instead of re-reading tags it wrote itself.
+    func noteRewritten(path: String, size: Int64) throws {
+        try db.prepare("UPDATE track SET file_size = ?, file_mtime = NULL WHERE path = ?").run([size, path])
     }
 
+    /// Called when a bookmark resolved to a new location, so the next lookup is direct.
     func updatePath(_ path: String, bookmark: Data?, forTrack trackID: Int64) throws {
         let statement = try db.prepare("UPDATE track SET path = ?, bookmark = COALESCE(?, bookmark) WHERE id = ?")
         try statement.run([path, bookmark, trackID])
     }
+}
+
+/// One `track` column as loaded into `Track`: the single list that loading, refreshing and
+/// copying tracks all go by. Immutable (closures over key paths), so safe to share.
+struct LibraryColumn: @unchecked Sendable {
+    let name: String
+    let load: (Statement, Int32, Track) -> Void
+    /// Copies the value from the first track to the second.
+    let copy: (Track, Track) -> Void
+
+    private init<Value>(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Value>, read: @escaping (Statement, Int32) -> Value) {
+        self.name = name
+        load = { statement, index, track in track[keyPath: keyPath] = read(statement, index) }
+        copy = { source, target in target[keyPath: keyPath] = source[keyPath: keyPath] }
+    }
+
+    static func text(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, String>) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { $0.string($1) ?? "" }
+    }
+
+    static func int(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Int>) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { Int($0.int($1) ?? 0) }
+    }
+
+    static func int64(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Int64>) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { $0.int($1) ?? 0 }
+    }
+
+    static func real(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Double>) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { $0.double($1) ?? 0 }
+    }
+
+    static func flag(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Bool>, default value: Bool = false) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { ($0.int($1) ?? (value ? 1 : 0)) != 0 }
+    }
+
+    /// Stored as Unix time.
+    static func date(_ name: String, _ keyPath: ReferenceWritableKeyPath<Track, Date?>) -> LibraryColumn {
+        LibraryColumn(name, keyPath) { $0.double($1).map { Date(timeIntervalSince1970: $0) } }
+    }
+}
+
+extension Track {
+    static let columns: [LibraryColumn] = [
+        .text("title", \.title), .text("artist", \.artist), .text("album", \.album), .text("album_artist", \.albumArtist),
+        .text("genre", \.genre), .text("composer", \.composer), .text("grouping", \.grouping), .text("comment", \.comment),
+        .int("year", \.year), .int("track_number", \.trackNumber), .int("track_count", \.totalNumberOfTracks),
+        .int("disc_number", \.discNumber), .int("disc_count", \.totalNumberOfDiscs), .real("duration", \.length),
+        .int("bit_rate", \.bitRate), .int("sample_rate", \.sampleRate), .int("bit_depth", \.bitDepth),
+        .int("channels", \.channels), .int("bpm", \.bpm), .text("musical_key", \.musicalKey), .int64("file_size", \.fileSize),
+        .flag("compilation", \.compilation), .flag("enabled", \.enabled, default: true), .real("rating", \.rating),
+        .int("play_count", \.playCount), .date("date_added", \.dateAdded), .date("last_played", \.lastPlayed),
+        .date("date_modified", \.dateModified), .date("date_created", \.dateCreated), .text("path", \.path),
+    ]
 }

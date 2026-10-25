@@ -173,6 +173,7 @@ private struct DeckView: View {
                 HStack(spacing: 6) {
                     NudgeButton(deck: deck, direction: -1)
                     Slider(value: $deck.tempo, in: -Deck.tempoRange...Deck.tempoRange)
+                        .accessibilityLabel("Deck \(deck.side.name) tempo")
                         .controlSize(.mini)
                         .frame(minWidth: 60, maxWidth: 120)
                         .onTapGesture(count: 2) { deck.tempo = 0 }
@@ -215,14 +216,14 @@ private struct DeckView: View {
                         .padding(.vertical, 1)
                         .background(accent.opacity(0.15), in: RoundedRectangle(cornerRadius: 3))
                     if let track = deck.track {
-                        Text(track.title.isEmpty ? track.fileName : track.title).font(.headline).lineLimit(1)
+                        Text(track.displayTitle).font(.headline).lineLimit(1)
                         if deck.isLoading { ProgressView().controlSize(.mini) }
                     } else {
                         Text("Empty").font(.headline).foregroundStyle(.secondary)
                     }
                 }
                 if let error = deck.errorMessage {
-                    Text(error).font(.subheadline).foregroundStyle(.red).lineLimit(1)
+                    Text(error).font(.subheadline).foregroundStyle(Palette.error).lineLimit(1)
                 } else if let track = deck.track {
                     Text([track.displayArtist, track.album].filter { !$0.isEmpty }.joined(separator: " — "))
                         .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
@@ -475,10 +476,10 @@ private struct MixerSection: View {
                 ChannelStrip(deck: mixer.a, accent: Palette.warm, knobsLeading: true)
                 Spacer(minLength: 0)
                 VStack(spacing: 4) {
-                    Knob(value: $mixer.masterVolume, range: 0...1, defaultValue: 0.8, accent: Palette.warm, size: 28)
+                    Knob(label: "Master volume", value: $mixer.masterVolume, range: 0...1, defaultValue: 0.8, accent: Palette.warm, size: 28)
                     StripLabel("Master")
                     if let error = mixer.errorMessage {
-                        Image(systemName: "exclamationmark.triangle").foregroundStyle(.red).help(error)
+                        Image(systemName: "exclamationmark.triangle").foregroundStyle(Palette.error).help(error)
                     }
                 }
                 .frame(maxHeight: .infinity)
@@ -528,11 +529,11 @@ private struct ChannelStrip: View {
 
     private var knobs: some View {
         VStack(spacing: 1) {
-            Knob(value: $deck.high, range: -1...1, defaultValue: 0, accent: accent)
+            Knob(label: "Deck \(deck.side.name) high", value: $deck.high, range: -1...1, defaultValue: 0, accent: accent)
             StripLabel("Hi")
-            Knob(value: $deck.mid, range: -1...1, defaultValue: 0, accent: accent)
+            Knob(label: "Deck \(deck.side.name) mid", value: $deck.mid, range: -1...1, defaultValue: 0, accent: accent)
             StripLabel("Mid")
-            Knob(value: $deck.low, range: -1...1, defaultValue: 0, accent: accent)
+            Knob(label: "Deck \(deck.side.name) low", value: $deck.low, range: -1...1, defaultValue: 0, accent: accent)
             StripLabel("Low")
         }
     }
@@ -540,6 +541,7 @@ private struct ChannelStrip: View {
     /// A rotated system slider, like the Equalizer's bands.
     private var fader: some View {
         Slider(value: $deck.level, in: 0...1)
+            .accessibilityLabel("Deck \(deck.side.name) level")
             .controlSize(.small)
             .frame(width: 104)
             .rotationEffect(.degrees(-90))
@@ -563,6 +565,8 @@ private struct StripLabel: View {
 /// A rotary control: drag up or down to turn, double-click to reset. Drawn like a system slider
 /// knob, with an arc from the resting position to the value.
 private struct Knob: View {
+    /// What VoiceOver calls it ("Deck A high").
+    let label: String
     @Binding var value: Float
     let range: ClosedRange<Float>
     let defaultValue: Float
@@ -609,6 +613,7 @@ private struct Knob: View {
         )
         .simultaneousGesture(TapGesture(count: 2).onEnded { value = defaultValue })
         .accessibilityElement()
+        .accessibilityLabel(label)
         .accessibilityValue(String(format: "%.0f%%", fraction * 100))
         .accessibilityAdjustableAction { direction in
             let step = span / 20

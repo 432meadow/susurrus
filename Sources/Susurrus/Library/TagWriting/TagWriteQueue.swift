@@ -29,12 +29,15 @@ final class TagWriteQueue {
     @ObservationIgnored var isInUse: (String) -> Bool = { _ in false }
     /// Called after a file was rewritten, with its new size.
     @ObservationIgnored var didWrite: (String, Int64) -> Void = { _, _ in }
-    /// Called with the values still waiting for a path whenever they change (nil once written or
-    /// given up on), so the queue can be saved and picked up again after a quit.
+    /// Called with the values still to be written to a path whenever they change (nil once written
+    /// or given up on), so the queue can be saved and picked up again after a quit. For a file
+    /// being written, they include the values being written until that write is done.
     @ObservationIgnored var persist: (String, TagValues?) -> Void = { _, _ in }
 
     @ObservationIgnored private var pending: [String: TagValues] = [:]
     @ObservationIgnored private var order: [String] = []
+    /// The write under way.
+    @ObservationIgnored private var inFlight: (path: String, values: TagValues)?
     @ObservationIgnored private var worker: Task<Void, Never>?
     @ObservationIgnored private let write: Writer
     @ObservationIgnored private let retryDelay: Duration
@@ -45,7 +48,26 @@ final class TagWriteQueue {
     }
 
     func enqueue(_ values: TagValues, path: String) {
-        guard !values.isEmpty else { return }
+        guard add(values, path: path) else { return }
+        if let inFlight, inFlight.path == path {
+            // If susurrus quits before that write is done, both edits still have to be written.
+            persist(path, inFlight.values.merged(with: pending[path]!))
+        } else {
+            persist(path, pending[path])
+        }
+    }
+
+    /// Queues writes an earlier run saved through `persist`, without saving them again. For
+    /// launch, before anything else is queued.
+    func resume(_ saved: [(path: String, values: TagValues)]) {
+        for (path, values) in saved { add(values, path: path) }
+    }
+
+    /// Adds the values to what's pending for `path` and starts the worker; false if there's
+    /// nothing to write.
+    @discardableResult
+    private func add(_ values: TagValues, path: String) -> Bool {
+        guard !values.isEmpty else { return false }
         if worker == nil {
             done = 0
             total = 0
@@ -58,10 +80,10 @@ final class TagWriteQueue {
             order.append(path)
             total += 1
         }
-        persist(path, pending[path])
         if worker == nil {
             worker = Task { [weak self] in await self?.run() }
         }
+        return true
     }
 
     func clearFailures() {
@@ -84,11 +106,13 @@ final class TagWriteQueue {
             order.removeAll { $0 == path }
             guard let values = pending.removeValue(forKey: path) else { continue }
             currentPath = path
+            inFlight = (path, values)
 
             let write = write
             let result: Result<TagFileWriter.Outcome, Error> = await Task.detached(priority: .utility) {
                 do { return .success(try await write(values, URL(fileURLWithPath: path))) } catch { return .failure(error) }
             }.value
+            inFlight = nil
             switch result {
             case .success(.written(let size)):
                 written += 1
@@ -100,7 +124,8 @@ final class TagWriteQueue {
                 EventLog.shared.log("Tag write: \(error.localizedDescription) — \(path)")
                 if failures.count > 200 { failures.removeFirst(failures.count - 200) }
             }
-            // Edits that arrived while this write ran are still pending; keep those saved.
+            // The values just written (or given up on) are done with; edits that arrived meanwhile
+            // are still pending and stay saved.
             persist(path, pending[path])
             done += 1
         }

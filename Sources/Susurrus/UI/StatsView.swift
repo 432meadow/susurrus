@@ -173,14 +173,22 @@ private struct TopList: View {
         .onTapGesture(count: 2) { play(entry) }
         .simultaneousGesture(TapGesture().onEnded { if kind == .artist { model.showArtist(entry.title) } })
         .contextMenu {
-            Button(kind == .artist ? "Play Artist" : kind == .album ? "Play Album" : "Play") { play(entry) }
-            if let track {
-                Button("Go to Artist") { model.showArtist(artistName(entry, track)) }
-                if kind != .artist {
-                    Button("Show in Library") {
-                        model.selection = .allTracks
-                        model.requestReveal(of: track.id)
-                    }
+            switch kind {
+            case .artist:
+                Button("Play Artist") { play(entry) }
+                if let track { Button("Go to Artist") { model.showArtist(artistName(entry, track)) } }
+            case .album:
+                if let track, let album = model.albums(of: [track]).first {
+                    MenuEntries(entries: TrackMenu.entries(for: album, model: model, leading: [
+                        .action("Show in Library") { model.reveal(track) }, .separator,
+                    ]))
+                } else {
+                    Button("Play Album") { play(entry) }
+                }
+            default:
+                if let track {
+                    MenuEntries(entries: [.action("Show in Library") { model.reveal(track) }, .separator]
+                        + TrackMenu.entries(for: [track], model: model) { play(entry) })
                 }
             }
         }

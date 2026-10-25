@@ -658,7 +658,7 @@ private struct TrackColumn {
 
 // MARK: - Cells
 
-private final class TrackNSTableView: NSTableView {
+private final class TrackNSTableView: NSTableView, HandlesSpaceKey {
     var onReturn: (() -> Void)?
     var onSpace: (() -> Void)?
     /// When the last letter was typed: a space right after one belongs to type-to-select
@@ -723,7 +723,17 @@ private final class NowPlayingCell: NSTableCellView {
     var symbol: String? {
         didSet {
             guard symbol != oldValue else { return }
-            icon.image = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: "Now playing") }
+            icon.image = symbol.flatMap { NSImage(systemSymbolName: $0, accessibilityDescription: Self.description(of: $0)) }
+        }
+    }
+
+    /// What VoiceOver says for each mark the column shows.
+    private static func description(of symbol: String) -> String {
+        switch symbol {
+        case "exclamationmark.triangle": "File missing"
+        case "externaldrive.badge.xmark": "Volume not mounted"
+        case "speaker.fill": "Now playing, paused"
+        default: "Now playing"
         }
     }
 
@@ -796,8 +806,11 @@ private final class RatingCell: NSTableCellView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard rating > 0 else { return }
-        let color: NSColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        // An unrated track shows empty stars on the selected row, which is where they take clicks.
+        let isSelected = (superview as? NSTableRowView)?.isSelected == true
+        guard rating > 0 || (isSelected && onRate != nil) else { return }
+        let color: NSColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor
+            : rating > 0 ? .secondaryLabelColor : .tertiaryLabelColor
         let configuration = NSImage.SymbolConfiguration(pointSize: 9, weight: .regular)
             .applying(.init(paletteColors: [color]))
         var x = Self.inset

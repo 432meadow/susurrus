@@ -1,5 +1,5 @@
 import Foundation
-import UserNotifications
+@preconcurrency import UserNotifications
 
 /// Posts user notifications (finished downloads, wishlist finds). Needs the app bundle: run
 /// straight from `swift run` there's no bundle identifier and notifications are skipped.

@@ -121,10 +121,9 @@ struct BugReportView: View {
             // The link can't hold everything; the whole report goes on the clipboard to paste in.
             copy()
             notice = nil
-            let alert = NSAlert()
-            alert.messageText = "The diagnostics were too long for the link"
-            alert.informativeText = "The oldest events were left out of the issue. The whole report is on the clipboard if you want to paste it in instead."
-            alert.runModal()
+            model.notify("The diagnostics were too long for the link",
+                         "The oldest events were left out of the issue. The whole report is on the clipboard if you want to paste it in instead.",
+                         staysOpen: true)
         }
         NSWorkspace.shared.open(url)
         EventLog.shared.log("Opened a bug report", level: .info)

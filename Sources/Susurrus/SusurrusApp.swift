@@ -29,18 +29,18 @@ struct SusurrusApp: App {
                 }
             }
             CommandGroup(replacing: .newItem) {
-                Button("New Playlist") { model.createPlaylist() }
+                let selected = model.selectedTracks
+                Button("New Playlist") { model.newPlaylist() }
                     .keyboardShortcut("n", modifiers: .command)
-                Button("New Playlist from Selection") { model.createPlaylist(with: model.selectedTracks) }
+                Button("New Playlist from Selection") { model.newPlaylist(with: selected) }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(model.selectedTrackIDs.isEmpty)
+                    .disabled(selected.isEmpty)
                 Button("New Smart Playlist…") { model.smartPlaylistDraft = .new() }
                     .keyboardShortcut("n", modifiers: [.command, .option])
-                Button("New Playlist Folder") { model.createFolder() }
+                Button("New Playlist Folder") { model.newFolder() }
                 Divider()
                 Button("Add to Library…") { model.chooseFilesToAdd() }
                     .keyboardShortcut("o", modifiers: .command)
-                    .disabled(model.isScanning)
                 Divider()
                 Button("Import Playlist…") { model.chooseM3UToImport() }
                 Button("Export Playlist…") { if let id = model.selectedPlaylistID { model.exportPlaylistAsM3U(id) } }
@@ -58,8 +58,8 @@ struct SusurrusApp: App {
                     .disabled(model.missingTrackCount == 0)
                 Divider()
                 if model.coverSearch == nil {
-                    Button("Find Missing Covers for All Albums") {
-                        model.findMissingCovers(for: Album.group(model.tracks, sortedBy: .artist))
+                    Button("Find Missing Covers for All Albums…") {
+                        model.requestMissingCovers(for: Album.group(model.tracks, sortedBy: .artist))
                     }
                 } else {
                     Button("Stop Finding Covers") { model.stopFindingCovers() }
@@ -132,7 +132,7 @@ private struct TrackCommands: Commands {
             Button("Look Up Album on MusicBrainz…") { model.lookUpAlbum(for: selected) }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
                 .disabled(selected.isEmpty)
-            Button("Find Missing Covers") { model.findMissingCovers(for: model.albums(of: selected)) }
+            Button("Find Missing Covers") { model.requestMissingCovers(for: model.albums(of: selected)) }
                 .disabled(selected.isEmpty || model.coverSearch != nil)
             Divider()
             Button("Play Next") { model.playNext(selected) }
@@ -157,7 +157,7 @@ private struct TrackCommands: Commands {
             Button("Locate File…") { if let track = selected.first { model.locate(track) } }
                 .disabled(selected.count != 1 || model.unavailableTracks[selected[0].id] == nil)
             Button("Show in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting(selected.map { URL(fileURLWithPath: $0.path) })
+                NSWorkspace.shared.reveal(selected)
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
             .disabled(selected.isEmpty)
