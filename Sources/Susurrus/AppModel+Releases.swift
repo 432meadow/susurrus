@@ -49,8 +49,8 @@ final class ReleaseLookup: Identifiable {
     let id = UUID()
     let tracks: [Track]
     let inputs: [ReleaseMatcher.Input]
-    /// For a Soulseek download: where "Artist/Album (Year)" folders go.
-    let organizeRoot: URL?
+    /// For a Soulseek download: where its files go when `organizes` (nil for other tracks).
+    let filing: DownloadFiling?
 
     var artist: String
     var album: String
@@ -68,11 +68,11 @@ final class ReleaseLookup: Identifiable {
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var coverTask: Task<Void, Never>?
 
-    init(tracks: [Track], organizeRoot: URL?, organizes: Bool) {
+    init(tracks: [Track], filing: DownloadFiling?, organizes: Bool) {
         self.tracks = tracks
         inputs = tracks.map(ReleaseMatcher.Input.init)
-        self.organizeRoot = organizeRoot
-        self.organizes = organizes && organizeRoot != nil
+        self.filing = filing
+        self.organizes = organizes && filing != nil
         let folder = tracks.first.map { URL(fileURLWithPath: $0.path).deletingLastPathComponent().lastPathComponent } ?? ""
         (artist, album) = ReleaseMatcher.searchTerms(for: inputs, folderName: folder)
     }
@@ -153,22 +153,27 @@ struct CoverSearch: Equatable {
 extension AppModel {
     // MARK: Look Up Album
 
-    /// Opens Look Up Album for the tracks (one track stands for its whole album).
-    func lookUpAlbum(for tracks: [Track], organizeRoot: URL? = nil) {
+    /// Opens Look Up Album for the tracks (one track stands for its whole album). Files in the
+    /// download folder are susurrus's own downloads, wherever the lookup starts: for those it
+    /// offers what Settings ▸ Soulseek does with matched albums (moving them to the library
+    /// folder, or sorting them into "Artist/Album (Year)").
+    func lookUpAlbum(for tracks: [Track]) {
         var tracks = tracks
         if tracks.count == 1, !tracks[0].album.isEmpty { tracks = albumTracks(albumOf: tracks[0]) }
         guard !tracks.isEmpty else { return }
-        let lookup = ReleaseLookup(tracks: tracks, organizeRoot: organizeRoot, organizes: soulseek.organizesDownloads)
+        let isDownload = tracks.allSatisfy { isInDownloadFolder(URL(fileURLWithPath: $0.path)) }
+        let filing = downloadFiling
+        let lookup = ReleaseLookup(tracks: tracks, filing: isDownload ? (filing == .none ? .sort(downloadFolder) : filing) : nil,
+                                   organizes: filing != .none)
         releaseLookup = lookup
         lookup.search()
     }
 
     /// Look Up Album for a finished Soulseek download's folder.
     func lookUpDownload(folder: URL) {
-        let album = downloadAlbumFolder(for: folder)
-        let tracks = tracks(under: album)
+        let tracks = tracks(under: downloadAlbumFolder(for: folder))
         guard !tracks.isEmpty else { return }
-        lookUpAlbum(for: tracks, organizeRoot: URL(fileURLWithPath: soulseek.downloadFolderPath))
+        lookUpAlbum(for: tracks)
     }
 
     func applyLookup(_ lookup: ReleaseLookup) {
@@ -177,21 +182,22 @@ extension AppModel {
         guard let match = lookup.selected else { return }
         Task {
             await applyRelease(match, to: lookup.tracks, fields: lookup.fields, cover: lookup.includesCover ? lookup.cover : nil,
-                               isDownload: lookup.organizeRoot != nil, organizeRoot: lookup.organizes ? lookup.organizeRoot : nil)
+                               isDownload: lookup.filing != nil, filing: lookup.organizes ? lookup.filing ?? .none : .none)
         }
     }
 
     /// Applies a release to the tracks: tags (undoable, like Get Info), then the cover. A download
     /// (files susurrus fetched itself) has its tags written into the files even with "Write tags
-    /// to files" off, gets a cover.jpg, and can be moved into "Artist/Album (Year)" first.
+    /// to files" off, gets a cover.jpg, and by `filing` is sorted into "Artist/Album (Year)"
+    /// first, or queued for the library folder once all that is applied.
     /// Returns how many of the tracks (those still in the library) it was applied to.
     @discardableResult
     func applyRelease(_ match: ReleaseMatcher.Match, to tracks: [Track], fields: ReleaseMatcher.Fields, cover: Data?,
-                      isDownload: Bool = false, organizeRoot: URL? = nil, registersUndo: Bool = true) async -> Int {
+                      isDownload: Bool = false, filing: DownloadFiling = .none, registersUndo: Bool = true) async -> Int {
         let tracks = tracks.filter { tracksByID[$0.id] === $0 }
         guard !tracks.isEmpty else { return 0 }
-        if let organizeRoot {
-            await organize(tracks, as: match, under: organizeRoot)
+        if case .sort(let root) = filing {
+            await organize(tracks, as: match, under: root)
         }
         let edits = ReleaseMatcher.edits(for: match, inputs: tracks.map(ReleaseMatcher.Input.init), fields: fields)
         apply(tracks.compactMap { track in edits[track.id].map { ($0, [track]) } }, actionName: "Look Up Album",
@@ -204,6 +210,9 @@ extension AppModel {
         }
         if let cover {
             setCover(cover, for: tracks, writeToFiles: writesTagsToFiles || isDownload, saveInFolder: isDownload)
+        }
+        if filing == .library {
+            queueLibraryMove(of: tracks, as: match)
         }
         return tracks.count
     }
@@ -322,13 +331,16 @@ extension AppModel {
         return moves
     }
 
-    /// `url`, or "name (2).ext", "name (3).ext"… if something is already there.
+    /// `url`, or "name (2).ext", "name (3).ext"… if something is already there. A folder URL
+    /// has no extension: "Vol. 2 (2001)" becomes "Vol. 2 (2001) (2)".
     nonisolated static func unusedURL(_ url: URL) -> URL {
         guard FileManager.default.fileExists(atPath: url.path) else { return url }
-        let base = url.deletingPathExtension().lastPathComponent, ext = url.pathExtension
+        let isFolder = url.hasDirectoryPath
+        let base = isFolder ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+        let ext = isFolder ? "" : url.pathExtension
         for n in 2... {
             let name = "\(base) (\(n))" + (ext.isEmpty ? "" : ".\(ext)")
-            let candidate = url.deletingLastPathComponent().appendingPathComponent(name)
+            let candidate = url.deletingLastPathComponent().appendingPathComponent(name, isDirectory: isFolder)
             if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
         }
         return url
@@ -351,7 +363,8 @@ extension AppModel {
     // MARK: Cleaning up Soulseek downloads
 
     /// After finished downloads are imported: matches each album folder to a MusicBrainz release and,
-    /// when every file fits, fixes the tags, fetches the cover and (if set) moves it into place.
+    /// when every file fits, fixes the tags, fetches the cover and files it where Settings ▸ Soulseek
+    /// says (the library folder, or "Artist/Album (Year)" in the download folder).
     /// Folders that don't match with certainty are left alone, with a notification.
     func cleanUpDownloads(in folders: [URL], after scan: Task<ScanResult, Never>) {
         let albums = Set(folders.map(downloadAlbumFolder))
@@ -387,9 +400,8 @@ extension AppModel {
             return
         }
         let cover = await Self.frontCover(for: best.release)
-        let root = URL(fileURLWithPath: soulseek.downloadFolderPath)
         let applied = await applyRelease(best, to: tracks, fields: .all, cover: cover, isDownload: true,
-                                         organizeRoot: soulseek.organizesDownloads ? root : nil, registersUndo: false)
+                                         filing: downloadFiling, registersUndo: false)
         guard applied > 0 else {
             EventLog.shared.log("“\(folder.lastPathComponent)” matched on MusicBrainz, but its tracks left the library meanwhile")
             return

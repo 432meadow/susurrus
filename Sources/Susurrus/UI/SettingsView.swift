@@ -249,9 +249,26 @@ private struct SoulseekSettings: View {
                     .foregroundStyle(.secondary)
                 Toggle("Notify when a download folder finishes or a saved search finds something new", isOn: $soulseek.postsNotifications)
                 Toggle("Tag finished albums from MusicBrainz", isOn: $soulseek.tagsDownloads)
-                Toggle("Move them into Artist/Album (Year) folders", isOn: $soulseek.organizesDownloads)
+                Picker("Matched Albums", selection: $soulseek.matchedAlbums) {
+                    Text("Move to the library folder").tag(SoulseekModel.MatchedAlbums.moveToLibrary)
+                    Text("Sort into Artist/Album (Year) here").tag(SoulseekModel.MatchedAlbums.sort)
+                    Text("Leave as they are").tag(SoulseekModel.MatchedAlbums.leave)
+                }
+                .disabled(!soulseek.tagsDownloads)
+                .onChange(of: soulseek.matchedAlbums) { model.matchedAlbumsChanged() }
+                if soulseek.matchedAlbums == .moveToLibrary {
+                    LabeledContent("Library Folder") {
+                        HStack {
+                            Text(model.albumLibraryFolder?.path ?? "None: choose one, or add a watched folder")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Button("Choose…") { chooseAlbumFolder() }
+                        }
+                    }
                     .disabled(!soulseek.tagsDownloads)
-                Text("Only when every file matches a release's track list and the lengths agree; the tags and cover are written into the downloaded files. Anything less certain is left as it is: right-click it in Downloads ▸ Look Up Album… to pick the release.")
+                }
+                Text(matchedAlbumsNote)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -303,6 +320,32 @@ private struct SoulseekSettings: View {
             guard response == .OK, let url = panel.url else { return }
             MainActor.assumeIsolated { soulseek.downloadFolderPath = url.path }
         }
+    }
+
+    private func chooseAlbumFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Use"
+        panel.message = "Matched Soulseek albums will be moved into this folder, as Artist/Album (Year)."
+        panel.directoryURL = model.albumLibraryFolder
+        panel.begin { [model] response in
+            guard response == .OK, let url = panel.url else { return }
+            MainActor.assumeIsolated {
+                // The library's own folder is kept as the default, so it follows that folder.
+                model.soulseek.albumFolderPath = url.path == model.watchedFolders.first ? "" : url.path
+                model.moveDownloadedAlbums()
+            }
+        }
+    }
+
+    private var matchedAlbumsNote: String {
+        var note = "Only when every file matches a release's track list and the lengths agree; the tags and cover are written into the downloaded files. Anything less certain is left as it is: right-click it in Downloads ▸ Look Up Album… to pick the release."
+        if model.soulseek.matchedAlbums == .moveToLibrary {
+            note += " Then the album is copied into Artist/Album (Year) in the library folder, each file is checked, the library follows it there, and the download is deleted. While the library folder's disk isn't connected, albums wait for it."
+        }
+        return note
     }
 }
 

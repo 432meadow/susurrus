@@ -135,6 +135,14 @@ final class AppModel {
     @ObservationIgnored var coverSearchTask: Task<Void, Never>?
     /// Download folders already matched (or tried) this session, so each is cleaned up once.
     @ObservationIgnored var cleanedDownloadFolders = Set<String>()
+    /// Matched downloads waiting to go to the library folder, oldest first (saved next to the
+    /// library; see `moveDownloadedAlbums`).
+    var queuedAlbumMoves: [AlbumMove] = []
+    /// The album being moved to the library folder.
+    var albumMoveProgress: AlbumMoveProgress?
+    /// The queued albums wait because the library folder isn't there (its share isn't mounted).
+    var isWaitingForLibraryFolder = false
+    @ObservationIgnored var albumMoveTask: Task<Void, Never>?
 
     // MARK: Artists
 
@@ -325,6 +333,7 @@ final class AppModel {
         tagWriter.didWrite = { [weak self] path, size in self?.noteFileRewritten(path: path, size: size) }
         tagWriter.persist = { [weak self] path, values in try? self?.store?.savePendingTagWrite(values, forPath: path) }
         restorePendingTagWrites()
+        queuedAlbumMoves = albumMovesURL.map(AlbumMoveFiles.load) ?? []
         player.onUnplayable = { [weak self] track in self?.noteUnplayable(track) }
         bpmAnalyzer.didDetect = { [weak self] results in self?.saveDetectedBPMs(results) }
         keyAnalyzer.didDetect = { [weak self] results in self?.saveDetectedKeys(results) }
@@ -341,11 +350,15 @@ final class AppModel {
         }
 
         // Covers that failed while the music share was unmounted are worth retrying once it's back;
-        // so are files that looked missing. Only the volume that came or went is checked.
+        // so are files that looked missing. Only the volume that came or went is checked. Albums
+        // waiting for the library folder try again.
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] notification in
             ArtworkStore.shared.forgetMisses()
             let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
-            MainActor.assumeIsolated { self?.checkForMissingFiles(onVolume: volume) }
+            MainActor.assumeIsolated {
+                self?.checkForMissingFiles(onVolume: volume)
+                self?.moveDownloadedAlbums()
+            }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] notification in
             let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
@@ -355,6 +368,7 @@ final class AppModel {
             try? await Task.sleep(for: .seconds(60))  // after launch has settled and the share has had time to mount
             self?.checkForMissingFiles()
         }
+        moveDownloadedAlbums()  // those still waiting from the last run
     }
 
     var playlistsByID: [Int64: Playlist] {

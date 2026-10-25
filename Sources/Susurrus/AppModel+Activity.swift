@@ -44,6 +44,14 @@ extension AppModel {
             result.append(Activity(id: "covers", title: "Finding covers", done: search.done, total: search.total,
                                    stop: { [weak self] in self?.stopFindingCovers() }))
         }
+        if let move = albumMoveProgress {
+            result.append(Activity(id: "move", title: "Moving “\(move.title)” to the library", done: move.done, total: move.total,
+                                   stop: { [weak self] in self?.stopMovingAlbums() }))
+        } else if isWaitingForLibraryFolder, !queuedAlbumMoves.isEmpty {
+            let count = queuedAlbumMoves.count
+            result.append(Activity(id: "move", title: "\(count) \(count == 1 ? "album waits" : "albums wait") for the library folder",
+                                   stop: { [weak self] in self?.stopMovingAlbums() }))
+        }
         if isCheckingForMissingFiles {
             result.append(Activity(id: "missing", title: "Checking for missing files",
                                    stop: { [weak self] in self?.stopCheckingForMissingFiles() }))

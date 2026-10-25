@@ -90,6 +90,11 @@ final class TagWriteQueue {
         failures.removeAll()
     }
 
+    /// Whether a write to `path` is waiting or under way.
+    func isWriting(_ path: String) -> Bool {
+        pending[path] != nil || inFlight?.path == path
+    }
+
     /// Waits until everything queued so far has been written (for tests).
     func waitUntilIdle() async {
         while let worker { await worker.value }

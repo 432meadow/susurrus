@@ -196,8 +196,8 @@ struct ReleaseLookupView: View {
             field("Track & Disc Numbers", .numbers)
             Toggle("Cover", isOn: $lookup.includesCover)
                 .disabled(lookup.cover == nil)
-            if lookup.organizeRoot != nil {
-                Toggle("Move into Artist/Album (Year)", isOn: $lookup.organizes)
+            if let filing = lookup.filing {
+                Toggle(filing == .library ? "Move to the library folder" : "Move into Artist/Album (Year)", isOn: $lookup.organizes)
             }
         }
         .toggleStyle(.checkbox)
@@ -213,7 +213,7 @@ struct ReleaseLookupView: View {
     private var coverWillApply: Bool { lookup.includesCover && lookup.cover != nil }
 
     private var writeNote: String {
-        if lookup.organizeRoot != nil {
+        if lookup.filing != nil {
             return "Downloaded files get the new tags and cover written into them."
         }
         return model.writesTagsToFiles

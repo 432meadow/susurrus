@@ -204,9 +204,34 @@ final class SoulseekModel {
         didSet { UserDefaults.standard.set(tagsDownloads, forKey: "soulseek.tagDownloads") }
     }
 
-    /// Matched downloads are also moved into "Artist/Album (Year)" folders in the download folder.
-    var organizesDownloads: Bool = UserDefaults.standard.bool(forKey: "soulseek.organizeDownloads") {
-        didSet { UserDefaults.standard.set(organizesDownloads, forKey: "soulseek.organizeDownloads") }
+    /// What happens to a finished album once it's matched and tagged.
+    enum MatchedAlbums: String {
+        /// Copied into "Artist/Album (Year)" in the library folder, then deleted from the download
+        /// folder (see `AppModel.moveDownloadedAlbums`).
+        case moveToLibrary
+        /// Moved into "Artist/Album (Year)" folders in the download folder.
+        case sort
+        /// Left where it downloaded.
+        case leave
+    }
+
+    var matchedAlbums: MatchedAlbums = SoulseekModel.matchedAlbums(
+        stored: UserDefaults.standard.string(forKey: "soulseek.matchedAlbums"),
+        sorted: UserDefaults.standard.object(forKey: "soulseek.organizeDownloads") as? Bool) {
+        didSet { UserDefaults.standard.set(matchedAlbums.rawValue, forKey: "soulseek.matchedAlbums") }
+    }
+
+    /// Where matched albums go with `.moveToLibrary`; empty for the library's first watched folder.
+    var albumFolderPath: String = UserDefaults.standard.string(forKey: "soulseek.albumFolder") ?? "" {
+        didSet { UserDefaults.standard.set(albumFolderPath, forKey: "soulseek.albumFolder") }
+    }
+
+    /// The saved choice. Before there was one, "Move them into Artist/Album (Year) folders" said
+    /// whether to sort them (if it was ever switched); moving to the library is the default.
+    nonisolated static func matchedAlbums(stored: String?, sorted: Bool?) -> MatchedAlbums {
+        if let stored, let choice = MatchedAlbums(rawValue: stored) { return choice }
+        if let sorted { return sorted ? .sort : .leave }
+        return .moveToLibrary
     }
 
     static var defaultDownloadFolder: String {

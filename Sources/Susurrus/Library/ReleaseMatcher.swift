@@ -252,9 +252,14 @@ enum ReleaseMatcher {
 
     /// "Album Artist/Album (Year)" under `root`, each part made safe for a folder name.
     static func albumFolder(under root: URL, albumArtist: String, album: String, year: Int?) -> URL {
+        root.appendingPathComponent(albumFolderPath(albumArtist: albumArtist, album: album, year: year), isDirectory: true)
+    }
+
+    /// "Album Artist/Album (Year)", relative to wherever albums are kept.
+    static func albumFolderPath(albumArtist: String, album: String, year: Int?) -> String {
         let artistPart = safeName(albumArtist.isEmpty ? "Unknown Artist" : albumArtist)
         let albumPart = safeName((album.isEmpty ? "Unknown Album" : album) + (year.map { " (\($0))" } ?? ""))
-        return root.appendingPathComponent(artistPart, isDirectory: true).appendingPathComponent(albumPart, isDirectory: true)
+        return artistPart + "/" + albumPart
     }
 
     /// "03 Title.flac", or "1-03 Title.flac" on a release with several discs.
