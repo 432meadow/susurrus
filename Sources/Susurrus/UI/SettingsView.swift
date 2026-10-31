@@ -328,7 +328,7 @@ private struct SoulseekSettings: View {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.prompt = "Use"
-        panel.message = "Matched Soulseek albums will be moved into this folder, as Artist/Album (Year)."
+        panel.message = "Matched Soulseek albums will be moved into this folder, as Artist/Album."
         panel.directoryURL = model.albumLibraryFolder
         panel.begin { [model] response in
             guard response == .OK, let url = panel.url else { return }
@@ -343,7 +343,7 @@ private struct SoulseekSettings: View {
     private var matchedAlbumsNote: String {
         var note = "Only when every file matches a release's track list and the lengths agree; the tags and cover are written into the downloaded files. Anything less certain is left as it is: right-click it in Downloads ▸ Look Up Album… to pick the release."
         if model.soulseek.matchedAlbums == .moveToLibrary {
-            note += " Then the album is copied into Artist/Album (Year) in the library folder, each file is checked, the library follows it there, and the download is deleted. While the library folder's disk isn't connected, albums wait for it."
+            note += " Then the album is copied into Artist/Album in the library folder, each file is checked, the library follows it there, and the download is deleted. While the library folder's disk isn't connected, albums wait for it."
         }
         return note
     }

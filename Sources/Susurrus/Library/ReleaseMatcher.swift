@@ -167,7 +167,7 @@ enum ReleaseMatcher {
 
     /// The disc and track number from the tags, else from the file name ("03 Title", "1-03 Title",
     /// "103 Title"). `flat` = a number that counts across discs.
-    private static func numbers(of input: Input) -> (disc: Int, track: Int, flat: Bool) {
+    static func numbers(of input: Input) -> (disc: Int, track: Int, flat: Bool) {
         if input.trackNumber > 0 { return (input.discNumber, input.trackNumber, false) }
         let name = input.fileName
         if let match = name.firstMatch(of: #/^\s*(\d{1,2})[-\.](\d{1,3})\b/#) {

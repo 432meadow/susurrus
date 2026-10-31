@@ -143,6 +143,8 @@ final class AppModel {
     /// The queued albums wait because the library folder isn't there (its share isn't mounted).
     var isWaitingForLibraryFolder = false
     @ObservationIgnored var albumMoveTask: Task<Void, Never>?
+    /// Download folders Move to Library is looking up on MusicBrainz, before they're queued.
+    var preparingAlbumMoves = Set<String>()
 
     // MARK: Artists
 

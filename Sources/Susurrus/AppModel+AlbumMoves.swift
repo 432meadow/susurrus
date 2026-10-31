@@ -6,7 +6,7 @@ enum DownloadFiling: Equatable {
     case none
     /// Into "Artist/Album (Year)" in the download folder (its root given), right away.
     case sort(URL)
-    /// Into "Artist/Album (Year)" in the library folder once their tags are written, and the
+    /// Into "Artist/Album" in the library folder once their tags are written, and the
     /// downloaded copies are deleted (see `AppModel.moveDownloadedAlbums`).
     case library
 }
@@ -19,15 +19,19 @@ struct AlbumMoveProgress: Equatable {
 }
 
 /// Moving matched Soulseek downloads to the library folder: each album is copied there as
-/// "Artist/Album (Year)" and checked, the library is pointed at the copies, and then the download
+/// "Artist/Album" and checked, the library is pointed at the copies, and then the download
 /// is deleted. While the library folder isn't there (its share isn't mounted), albums wait, saved.
 extension AppModel {
-    /// Settings ▸ Soulseek's library folder: the one picked there, else the library's first
-    /// watched folder. Nil unless matched albums are set to move there.
-    var albumLibraryFolder: URL? {
-        guard soulseek.matchedAlbums == .moveToLibrary else { return nil }
+    /// Where albums go in the library: the folder picked in Settings ▸ Soulseek, else the
+    /// library's first watched folder.
+    var libraryFolder: URL? {
         let path = soulseek.albumFolderPath.isEmpty ? watchedFolders.first ?? "" : soulseek.albumFolderPath
         return path.isEmpty ? nil : URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// The library folder, if matched albums are set to move there on their own.
+    var albumLibraryFolder: URL? {
+        soulseek.matchedAlbums == .moveToLibrary ? libraryFolder : nil
     }
 
     /// What Settings ▸ Soulseek says to do with a matched download.
@@ -61,6 +65,12 @@ extension AppModel {
             EventLog.shared.log("Didn't move “\(match.release.title)” to the library: its files aren't one folder in the download folder")
             return
         }
+        queueAlbumMove(albumMove(of: tracks, in: folder, as: match))
+    }
+
+    /// The move for an album with a release: the library's "Artist/Album" (or "Compilations/Album"),
+    /// files named after the release.
+    private func albumMove(of tracks: [Track], in folder: URL, as match: ReleaseMatcher.Match) -> AlbumMove {
         let release = match.release
         let artist = release.isVariousArtists ? "Various Artists" : release.artist
         var names: [Int64: String] = [:]
@@ -68,10 +78,10 @@ extension AppModel {
             guard let pair = match.pairs[track.id] else { continue }
             names[track.id] = ReleaseMatcher.fileName(for: pair.slot, extension: (track.path as NSString).pathExtension)
         }
-        queueAlbumMove(AlbumMove(folder: folder.path,
-                                 target: ReleaseMatcher.albumFolderPath(albumArtist: artist, album: release.title, year: release.year),
-                                 title: "\(artist) – \(release.title)" + (release.year.map { " (\($0))" } ?? ""),
-                                 names: names))
+        return AlbumMove(folder: folder.path,
+                         target: TagFiling.libraryPath(artist: artist, album: release.title, isCompilation: release.isVariousArtists),
+                         title: "\(artist) – \(release.title)" + (release.year.map { " (\($0))" } ?? ""),
+                         names: names)
     }
 
     /// Queues an album (in place of an earlier entry for its folder) and starts moving.
@@ -114,13 +124,74 @@ extension AppModel {
         }
     }
 
+    // MARK: Move to Library
+
+    /// Whether a finished download's folder can be moved now: it's in the download folder, all
+    /// its transfers are over, it's in the library, and it isn't on its way already.
+    func canMoveDownloadToLibrary(folder: URL) -> Bool {
+        let album = downloadAlbumFolder(for: folder).standardizedFileURL
+        guard libraryFolder != nil, isInDownloadFolder(album), !preparingAlbumMoves.contains(album.path),
+              !queuedAlbumMoves.contains(where: { $0.folder == album.path }),
+              !soulseek.downloads.contains(where: { $0.isActive && $0.localURL.path.hasPrefix(album.path + "/") }) else { return false }
+        return !tracks(under: album).isEmpty
+    }
+
+    /// The download folders of those tracks that can be moved now. The downloads list isn't kept
+    /// between launches, so older downloads are only reachable through their tracks.
+    func movableDownloadFolders(of tracks: [Track]) -> [URL] {
+        let folders = Set(tracks.map { downloadAlbumFolder(for: URL(fileURLWithPath: $0.path).deletingLastPathComponent()).standardizedFileURL })
+        return folders.filter(canMoveDownloadToLibrary).sorted { $0.path < $1.path }
+    }
+
+    /// Right-click ▸ Move to Library: files a download in the library folder and deletes the
+    /// downloaded copy, whatever Settings ▸ Soulseek does with matched albums. With a sure
+    /// MusicBrainz match the release's tags and cover go in first; without one the files go by
+    /// their own tags, unchanged.
+    func moveDownloadToLibrary(folder: URL) {
+        guard canMoveDownloadToLibrary(folder: folder) else { return }
+        let album = downloadAlbumFolder(for: folder).standardizedFileURL
+        let tracks = tracks(under: album)
+        preparingAlbumMoves.insert(album.path)
+        cleanedDownloadFolders.insert(album.path)  // so it isn't matched and moved a second time
+        Task {
+            defer { preparingAlbumMoves.remove(album.path) }
+            let inputs = tracks.map(ReleaseMatcher.Input.init)
+            let terms = ReleaseMatcher.searchTerms(for: inputs, folderName: album.lastPathComponent)
+            let best = try? await ReleaseIdentifier.candidates(for: inputs, artist: terms.artist, album: terms.album).first
+            let match = best?.isConfident == true ? best : nil
+            var cover: Data?
+            if let match { cover = await Self.frontCover(for: match.release) }
+            await fileDownload(album, tracks: tracks, match: match, cover: cover)
+        }
+    }
+
+    /// Queues the album for the library folder, by the release when there is one, else by its tags.
+    func fileDownload(_ album: URL, tracks: [Track], match: ReleaseMatcher.Match?, cover: Data?) async {
+        if let match {
+            await applyRelease(match, to: tracks, fields: .all, cover: cover, isDownload: true, registersUndo: false)
+            queueAlbumMove(albumMove(of: tracks, in: album, as: match))
+            return
+        }
+        switch TagFiling.plan(for: tracks.map(ReleaseMatcher.Input.init), isCompilation: tracks.contains(where: \.compilation),
+                              folderName: album.lastPathComponent) {
+        case .plan(let plan):
+            queueAlbumMove(AlbumMove(folder: album.path, target: plan.target, title: plan.title, names: plan.names))
+        case .noArtist:
+            notify("Couldn't tell whose “\(album.lastPathComponent)” is",
+                   "Its tags name no artist. Add one with Get Info, then move it again.", kind: .error)
+        case .severalAlbums(let albums):
+            notify("“\(album.lastPathComponent)” isn't one album",
+                   "Its tags name \(albums.count) albums. Give the tracks one album with Get Info, then move it again.", kind: .error)
+        }
+    }
+
     // MARK: Moving
 
     private enum MoveOutcome { case done, offline, stopped }
 
     private func runAlbumMoves() async {
         while let move = queuedAlbumMoves.first, !Task.isCancelled {
-            guard let root = albumLibraryFolder else { return }
+            guard let root = libraryFolder else { return }
             let isThere = await BlockingIO.library.run { AlbumMoveFiles.isFolder(root) }
             isWaitingForLibraryFolder = !isThere
             guard isThere else {

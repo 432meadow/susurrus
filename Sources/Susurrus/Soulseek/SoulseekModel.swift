@@ -206,7 +206,7 @@ final class SoulseekModel {
 
     /// What happens to a finished album once it's matched and tagged.
     enum MatchedAlbums: String {
-        /// Copied into "Artist/Album (Year)" in the library folder, then deleted from the download
+        /// Copied into "Artist/Album" in the library folder, then deleted from the download
         /// folder (see `AppModel.moveDownloadedAlbums`).
         case moveToLibrary
         /// Moved into "Artist/Album (Year)" folders in the download folder.

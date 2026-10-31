@@ -52,6 +52,7 @@ enum TrackMenu {
             entries.append(.action("Go to Artist") { model.showArtist(first.displayArtist) })
         }
         entries.append(.action("Show in Finder") { NSWorkspace.shared.reveal(tracks) })
+        entries += moveToLibrary(tracks, model: model)
         if tracks.count == 1, model.unavailableTracks[first.id] != nil {
             entries.append(.action("Locate File…") { model.locate(first) })
         }
@@ -82,12 +83,19 @@ enum TrackMenu {
         if let artist = album.pageArtist, model.selection != .artists || model.artists.artist(named: artist)?.id != model.selectedArtistID {
             entries.append(.action("Go to Artist") { model.showArtist(artist) })
         }
+        entries.append(.action("Show in Finder") { NSWorkspace.shared.reveal(album.tracks) })
+        entries += moveToLibrary(album.tracks, model: model)
         entries += [
-            .action("Show in Finder") { NSWorkspace.shared.reveal(album.tracks) },
             .separator,
             .action("Remove Album from Library…") { model.confirmRemoveFromLibrary(album.tracks) },
         ]
         return entries
+    }
+
+    /// Move to Library, for tracks still in the download folder.
+    private static func moveToLibrary(_ tracks: [Track], model: AppModel) -> [Entry] {
+        let folders = model.movableDownloadFolders(of: tracks)
+        return folders.isEmpty ? [] : [.action("Move to Library") { folders.forEach { model.moveDownloadToLibrary(folder: $0) } }]
     }
 
     /// Detect BPM fills in missing tempos; once every selected track has one, it re-detects them.

@@ -194,8 +194,7 @@ import Testing
         await model.applyRelease(match, to: tracks, fields: .all, cover: nil, isDownload: true, filing: .library, registersUndo: false)
         #expect(model.queuedAlbumMoves.count == 1)
         await model.albumMoveTask?.value
-        let destination = library.appendingPathComponent(
-            ReleaseMatcher.albumFolderPath(albumArtist: "Aphex Twin", album: release.title, year: release.year))
+        let destination = library.appendingPathComponent("Aphex Twin/\(release.title)")
         #expect(contents(of: destination) == ["1-01 Cliffs.wav", "1-02 Radiator.wav", "1-03 Rhubarb.wav", "2-01 Hankie.wav", "2-02 Grass (Live).wav"])
         #expect(tracks.allSatisfy { $0.path.hasPrefix(destination.path + "/") })
         #expect(tracks.allSatisfy { !model.tagWriter.isWriting($0.path) }, "the tags went into the downloaded files first")
@@ -221,5 +220,92 @@ import Testing
         #expect(queue.isWriting("/a.mp3") && !queue.isWriting("/b.mp3"))
         await queue.waitUntilIdle()
         #expect(!queue.isWriting("/a.mp3"))
+    }
+}
+
+/// Move to Library: where a download goes by its own tags, when MusicBrainz has no sure match.
+@MainActor
+@Suite struct MoveToLibraryTests {
+    typealias Input = ReleaseMatcher.Input
+
+    @Test func oneTrackOfASingleGoesByItsTags() {
+        let track = Input(id: 1, title: "Breathe In (Watkins vocal mix)", artist: "Frou Frou", album: "Breathe In",
+                          path: "/d/Breathe In (2002)/Breathe In - 03 - Breathe In (Watkins vocal mix).flac")
+        #expect(TagFiling.plan(for: [track], isCompilation: false, folderName: "Breathe In (2002)") == .plan(.init(
+            target: "Frou Frou/Breathe In", title: "Frou Frou – Breathe In",
+            names: [1: "03 Breathe In (Watkins vocal mix).flac"])))
+    }
+
+    @Test func artistsAlbumsAndCompilations() throws {
+        func target(_ inputs: [Input], compilation: Bool = false, folder: String = "x") -> String? {
+            if case .plan(let plan) = TagFiling.plan(for: inputs, isCompilation: compilation, folderName: folder) { return plan.target }
+            return nil
+        }
+        let tagged = Input(id: 1, title: "T", artist: "Guest", album: "Album", albumArtist: "Band", path: "/d/1.mp3")
+        #expect(target([tagged]) == "Band/Album", "the album artist wins")
+        #expect(target([tagged], compilation: true) == "Compilations/Album")
+        #expect(target([Input(id: 1, artist: "A", album: "Mix", albumArtist: "VA", path: "/d/1.mp3")]) == "Compilations/Mix")
+        let mixed = ["A", "B", "C"].enumerated().map { Input(id: Int64($0.offset), artist: $0.element, album: "Mix", path: "/d/\($0.offset).mp3") }
+        #expect(target(mixed) == "Compilations/Mix", "three artists and no album artist")
+        #expect(target([Input(id: 1, artist: "A", path: "/d/1.mp3")], folder: "Uploads") == "A/Unknown Album", "a bare folder name isn't an album")
+        #expect(target([Input(id: 1, path: "/d/1.mp3")], folder: "Band - Record (2001) [FLAC]") == "Band/Record")
+    }
+
+    @Test func whatItWontGuess() {
+        #expect(TagFiling.plan(for: [Input(id: 1, path: "/d/1.mp3")], isCompilation: false, folderName: "Uploads") == .noArtist)
+        let two = [Input(id: 1, artist: "A", album: "One", path: "/d/1.mp3"), Input(id: 2, artist: "A", album: "Two", path: "/d/2.mp3")]
+        #expect(TagFiling.plan(for: two, isCompilation: false, folderName: "x") == .severalAlbums(["One", "Two"]))
+    }
+
+    @Test func discsAndUntitledFiles() {
+        let inputs = [Input(id: 1, title: "A", trackNumber: 3, discNumber: 1, path: "/d/a.flac"),
+                      Input(id: 2, title: "B", trackNumber: 3, discNumber: 2, path: "/d/b.flac"),
+                      Input(id: 3, artist: "X", path: "/d/keeps.flac")]
+        guard case .plan(let plan) = TagFiling.plan(for: inputs, isCompilation: false, folderName: "x") else { Issue.record("no plan"); return }
+        #expect(plan.names == [1: "1-03 A.flac", 2: "2-03 B.flac"])
+    }
+
+    @Test func existingFoldersKeepTheirSpelling() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("MoveToLibraryTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("mike mind"), withIntermediateDirectories: true)
+        #expect(AlbumMoveFiles.matchingExistingFolders("Mike Mind/Aether", in: root) == "mike mind/Aether")
+        #expect(AlbumMoveFiles.matchingExistingFolders("New/Album", in: root) == "New/Album")
+    }
+
+    @Test func anUnmatchedDownloadMovesAndItsLocalCopyGoes() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("MoveToLibraryTests-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: base)
+            for key in ["soulseek.downloadFolder", "soulseek.matchedAlbums", "soulseek.albumFolder"] {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        let downloads = base.appendingPathComponent("Downloads", isDirectory: true)
+        let library = base.appendingPathComponent("Library", isDirectory: true)
+        let album = downloads.appendingPathComponent("Breathe In (2002)", isDirectory: true)
+        try FileManager.default.createDirectory(at: album, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let file = album.appendingPathComponent("Breathe In - 03 - Mix.flac")
+        try Data(repeating: 7, count: 100).write(to: file)
+
+        let model = AppModel(libraryURL: base.appendingPathComponent("Support/Library.sqlite"))
+        model.soulseek.downloadFolderPath = downloads.path
+        model.soulseek.matchedAlbums = .leave  // moving by hand doesn't depend on this
+        model.soulseek.albumFolderPath = library.path
+        let store = try #require(model.store)
+        let ids = try store.insert([ScannedTrack(path: file.path, title: "Mix", artist: "Frou Frou", album: "Breathe In")])
+        try model.reload()
+        let track = try #require(model.tracksByID[ids[0]])
+        #expect(model.canMoveDownloadToLibrary(folder: album))
+        #expect(model.movableDownloadFolders(of: [track]) == [album.standardizedFileURL], "reachable from the track too")
+
+        await model.fileDownload(album.standardizedFileURL, tracks: [track], match: nil, cover: nil)
+        await model.albumMoveTask?.value
+        let moved = library.appendingPathComponent("Frou Frou/Breathe In/03 Mix.flac")
+        #expect(FileManager.default.fileExists(atPath: moved.path))
+        #expect(track.path == moved.path, "the same track, at its new place")
+        #expect(!FileManager.default.fileExists(atPath: album.path), "the local copy is gone")
+        #expect(!model.canMoveDownloadToLibrary(folder: album))
     }
 }

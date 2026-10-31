@@ -379,6 +379,10 @@ private struct DownloadFolderHeader: View, Equatable {
             }
         }
         .lineLimit(1)
+        .contextMenu {
+            Button("Move to Library") { model.moveDownloadToLibrary(folder: folder.url) }
+                .disabled(!model.canMoveDownloadToLibrary(folder: folder.url))
+        }
     }
 
     private var summary: String {
@@ -449,6 +453,8 @@ private struct DownloadRow: View, Equatable {
             }
             Button("Look Up Album on MusicBrainz…") { model.lookUpDownload(folder: url.deletingLastPathComponent()) }
                 .disabled(model.track(atPath: url.path) == nil)
+            Button("Move to Library") { model.moveDownloadToLibrary(folder: url.deletingLastPathComponent()) }
+                .disabled(!model.canMoveDownloadToLibrary(folder: url.deletingLastPathComponent()))
         }
         if !download.isActive {
             Button("Remove") { soulseek.remove(download.id) }

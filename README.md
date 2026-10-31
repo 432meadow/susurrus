@@ -339,18 +339,19 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   **Matched Albums**:
   - **Move to the library folder** (the default): the folder picked there, else the library's
     first watched folder. Once the album's tags and cover are in the downloaded files (and none
-    of it is playing), it's copied into "Artist/Album (Year)" there, files renamed "03 Title.ext"
+    of it is playing), it's copied into "Artist/Album" there ("Compilations/Album" for a Various
+    Artists release), files renamed "03 Title.ext"
     ("1-03 Title.ext" on multi-disc releases), along with the rest of the folder (cue sheets,
     logs, images; disc folders flattened). Each copy's size is checked, the library is pointed at
     the copies (play counts, ratings and playlists stay), and then the download is deleted, its
     folder too unless audio that didn't match is left in it. So each file crosses to a network
     share once, finished. The copy collects in a hidden folder and appears in one step, so a
-    rescan never sees half an album, and a taken "Artist/Album (Year)" gets a " (2)". Albums are
+    rescan never sees half an album, and a taken "Artist/Album" gets a " (2)". Albums are
     moved one at a time, shown in the activity button (with Stop). While the library folder isn't
     there (its share isn't mounted), they wait, saved in `Album moves.json` next to the library,
     and move once it mounts or at the next launch. A move that fails for another reason leaves the
     album in the download folder and says why.
-  - **Sort into Artist/Album (Year) here**: the same names, inside the download folder.
+  - **Sort into Artist/Album (Year) here**: the same file names, inside the download folder.
   - **Leave as they are.** (Before there was a choice, "Move them into Artist/Album (Year)
     folders" decided between these two, and it still does for anyone who switched it.)
 
@@ -358,6 +359,14 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   **Look Up Album on MusicBrainz…** (or use it on the album's tracks anywhere in the library) to
   pick the release yourself, which files it the same way: files in the download folder count as
   downloads wherever the lookup starts.
+- **Move to Library** (right-click a finished download or its folder's heading, or any track or
+  album still in the download folder): files that download in the library folder now and deletes the downloaded copy, whatever Matched Albums is
+  set to. With a sure MusicBrainz match it gets the release's tags and cover first. Without one
+  (one track of a single, say) it goes by its own tags, which aren't changed: "Artist/Album/03
+  Title.flac", or "Compilations/Album" for various artists, spelled like an artist folder that's
+  already there. It's the same checked copy as above, and it waits the same way for a share that
+  isn't mounted. If the tags name no artist, or several albums, it stays put and says so; an album
+  folder that's already there is never merged into, the new one gets a " (2)".
 - **Notifications** (Settings ▸ Soulseek, on by default) when a download folder finishes and is
   imported, and when a saved search turns up new results; a separate switch covers private
   messages (one per sender, so a burst at login doesn't flood). They need the app bundle (not
@@ -453,7 +462,7 @@ volume (SMB, AFP, NFS) can arrive slowly (the share susurrus was developed again
 | `Sources/Susurrus/Reporting/` | Bug reports: event log, diagnostics, redaction, crash report summaries, the GitHub issue link |
 | `Sources/Susurrus/UI/` | Track table (NSTableView), shared track and album menus, sidebar, albums, browser, Up Next, Get Info, smart editor, EQ, mixer, import and export sheets, activity button and notices, Soulseek (+ messages and user info), settings, menu bar |
 | `Sources/ObjCSupport/` | Catches NSExceptions (predicate evaluation, audio graph connections) |
-| `Tests/SusurrusTests/` | 278 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download), fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, and saved conversations |
+| `Tests/SusurrusTests/` | 284 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download, moving by a download's own tags), fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, and saved conversations |
 
 ## Known issues
 
