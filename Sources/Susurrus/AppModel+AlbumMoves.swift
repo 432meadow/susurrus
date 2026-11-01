@@ -21,6 +21,11 @@ struct AlbumMoveProgress: Equatable {
 /// Moving matched Soulseek downloads to the library folder: each album is copied there as
 /// "Artist/Album" and checked, the library is pointed at the copies, and then the download
 /// is deleted. While the library folder isn't there (its share isn't mounted), albums wait, saved.
+///
+/// Once the copy is finished, what comes next is saved in the queue first (`AlbumMove.Commit`). A
+/// move cut short after that is picked up by what it left: tracks already pointed at a finished
+/// copy go forward, and anything earlier starts over from the download, which is only deleted
+/// once the album is safely in its folder.
 extension AppModel {
     /// Where albums go in the library: the folder picked in Settings ▸ Soulseek, else the
     /// library's first watched folder.
@@ -84,8 +89,10 @@ extension AppModel {
                          names: names)
     }
 
-    /// Queues an album (in place of an earlier entry for its folder) and starts moving.
+    /// Queues an album (in place of an earlier entry for its folder) and starts moving. A move
+    /// that's already past its copy carries on as it was.
     func queueAlbumMove(_ move: AlbumMove) {
+        guard !queuedAlbumMoves.contains(where: { $0.folder == move.folder && $0.commit != nil }) else { return }
         queuedAlbumMoves.removeAll { $0.folder == move.folder }
         queuedAlbumMoves.append(move)
         saveAlbumMoves()
@@ -103,8 +110,9 @@ extension AppModel {
     }
 
     /// Stops moving: the album being copied stays in the download folder, as do those waiting.
+    /// One the library already follows has to reach its folder, so that goes on.
     func stopMovingAlbums() {
-        queuedAlbumMoves.removeAll()
+        queuedAlbumMoves.removeAll { move in move.commit.map { !isFollowed($0) } ?? true }
         saveAlbumMoves()
         isWaitingForLibraryFolder = false
         albumMoveTask?.cancel()
@@ -136,8 +144,8 @@ extension AppModel {
         return !tracks(under: album).isEmpty
     }
 
-    /// The download folders of those tracks that can be moved now. The downloads list isn't kept
-    /// between launches, so older downloads are only reachable through their tracks.
+    /// The download folders of those tracks that can be moved now. Finished downloads aren't kept
+    /// between launches, so older ones are only reachable through their tracks.
     func movableDownloadFolders(of tracks: [Track]) -> [URL] {
         let folders = Set(tracks.map { downloadAlbumFolder(for: URL(fileURLWithPath: $0.path).deletingLastPathComponent()).standardizedFileURL })
         return folders.filter(canMoveDownloadToLibrary).sorted { $0.path < $1.path }
@@ -187,11 +195,17 @@ extension AppModel {
 
     // MARK: Moving
 
-    private enum MoveOutcome { case done, offline, stopped }
+    private enum MoveOutcome {
+        case done, offline, stopped
+        /// Back to square one for this album: it's moved again.
+        case startOver
+    }
 
     private func runAlbumMoves() async {
         while let move = queuedAlbumMoves.first, !Task.isCancelled {
-            guard let root = libraryFolder else { return }
+            // One that's past its copy goes where it started, whatever the setting says now.
+            let committedRoot = move.commit.map { URL(fileURLWithPath: $0.staging).deletingLastPathComponent() }
+            guard let root = committedRoot ?? libraryFolder else { return }
             let isThere = await BlockingIO.library.run { AlbumMoveFiles.isFolder(root) }
             isWaitingForLibraryFolder = !isThere
             guard isThere else {
@@ -207,6 +221,8 @@ extension AppModel {
                 return
             case .stopped:
                 return
+            case .startOver:
+                continue
             }
         }
     }
@@ -216,8 +232,9 @@ extension AppModel {
     /// crosses to the share once, finished) and for none of it to be playing.
     private func moveAlbum(_ move: AlbumMove, to root: URL) async -> MoveOutcome {
         let folder = URL(fileURLWithPath: move.folder, isDirectory: true)
-        albumMoveProgress = AlbumMoveProgress(title: move.title, total: tracks(under: folder).count)
+        albumMoveProgress = AlbumMoveProgress(title: move.title, total: move.commit?.files.count ?? tracks(under: folder).count)
         defer { albumMoveProgress = nil }
+        if let commit = move.commit { return await resumeMove(move, commit, root: root) }
         while tracks(under: folder).contains(where: { tagWriter.isWriting($0.path) || tagWriter.isInUse($0.path) }) {
             try? await Task.sleep(for: .seconds(2))
             if Task.isCancelled { return .stopped }
@@ -244,17 +261,94 @@ extension AppModel {
         case .failure(let error): return await moveFailed(move, root: root, error)
         }
 
+        // Edits that came in during the copy went into the downloaded files, not the copy.
+        if albumTracks.contains(where: { tagWriter.isWriting($0.path) }) {
+            await BlockingIO.library.run { AlbumMoveFiles.discard(copy) }
+            return Task.isCancelled ? .stopped : .startOver
+        }
+        // Stopped just as the copy finished.
+        guard queuedAlbumMoves.contains(where: { $0.folder == move.folder }) else {
+            await BlockingIO.library.run { AlbumMoveFiles.discard(copy) }
+            return .stopped
+        }
+
+        let commit = AlbumMove.Commit(staging: copy.staging.path, destination: copy.destination.path,
+                                      oldPaths: Dictionary(uniqueKeysWithValues: albumTracks.map { ($0.id, $0.path) }),
+                                      files: Dictionary(uniqueKeysWithValues: copy.files.map { ($0.id, $0.name) }))
+        do {
+            try setCommit(commit, of: move)
+        } catch {
+            await BlockingIO.library.run { AlbumMoveFiles.discard(copy) }
+            return await moveFailed(move, root: root, error)
+        }
+        return await finishMove(move, commit, stamps: copy.files.map { (id: $0.id, stamp: $0.stamp) }, root: root, isInPlace: false)
+    }
+
+    /// Picks up a move that was cut short after its copy was finished, by what it left.
+    private func resumeMove(_ move: AlbumMove, _ commit: AlbumMove.Commit, root: URL) async -> MoveOutcome {
+        switch await BlockingIO.library.run({ AlbumMoveFiles.progress(of: commit) }) {
+        case .staged(let stamps):
+            // The tracks still at the download can have changed since it was copied.
+            guard isFollowed(commit) else { return await startOver(move, commit) }
+            // Something else took that name meanwhile.
+            let destination = URL(fileURLWithPath: commit.destination, isDirectory: true)
+            var current = commit
+            current.destination = await BlockingIO.library.run { AppModel.unusedURL(destination).path }
+            do {
+                try setCommit(current, of: move)
+            } catch {
+                return await moveFailed(move, root: root, error)
+            }
+            return await finishMove(move, current, stamps: stamps, root: root, isInPlace: false)
+        case .inPlace(let stamps):
+            return await finishMove(move, commit, stamps: stamps, root: root, isInPlace: true)
+        case .lost:
+            // A share that just dropped looks the same from here.
+            guard await BlockingIO.library.run({ AlbumMoveFiles.isFolder(root) }) else { return .offline }
+            EventLog.shared.log("The copy of “\(move.title)” is gone; moving it again")
+            return await startOver(move, commit)
+        }
+    }
+
+    /// Back to the downloaded files, which haven't been touched, for a fresh copy.
+    private func startOver(_ move: AlbumMove, _ commit: AlbumMove.Commit) async -> MoveOutcome {
+        let oldPaths = commit.oldPaths.filter { tracksByID[$0.key] != nil && tracksByID[$0.key]?.path != $0.value }
+        guard oldPaths.isEmpty || relink(oldPaths, stamps: nil) else { return .stopped }
+        let staging = URL(fileURLWithPath: commit.staging, isDirectory: true)
+        await BlockingIO.library.run { try? FileManager.default.removeItem(at: staging) }
+        do {
+            try setCommit(nil, of: move)
+        } catch {
+            EventLog.shared.log("Couldn't save the albums waiting to move: \(error.localizedDescription)")
+            return .stopped
+        }
+        return .startOver
+    }
+
+    /// From a finished copy to the album in its folder and the download gone. Every step can be
+    /// done again, so it's safe to come back to after being cut short at any point.
+    private func finishMove(_ move: AlbumMove, _ commit: AlbumMove.Commit, stamps: [(id: Int64, stamp: FileStamp)],
+                            root: URL, isInPlace: Bool) async -> MoveOutcome {
+        let staging = URL(fileURLWithPath: commit.staging, isDirectory: true)
+        let destination = URL(fileURLWithPath: commit.destination, isDirectory: true)
+        let folder = URL(fileURLWithPath: move.folder, isDirectory: true)
+        let newPaths = commit.newPaths
+
         // The library follows the album before it appears in the library folder, so a rescan of
         // that folder right then finds its files already known instead of adding them again.
-        let oldPaths = Dictionary(uniqueKeysWithValues: albumTracks.map { ($0.id, $0.path) })
-        let newPaths = Dictionary(uniqueKeysWithValues: copy.files.map { ($0.id, copy.destination.appendingPathComponent($0.name).path) })
-        guard relink(newPaths, stamps: copy.files.map { (id: $0.id, stamp: $0.stamp) }) else {
-            await BlockingIO.library.run { AlbumMoveFiles.discard(copy) }
+        guard relink(newPaths, stamps: stamps) else {
+            if !isInPlace { await BlockingIO.library.run { try? FileManager.default.removeItem(at: staging) } }
             return .done
         }
-        if case .failure(let error) = await BlockingIO.library.run({ Result { try AlbumMoveFiles.putInPlace(copy) } }) {
-            _ = relink(oldPaths, stamps: nil)
-            await BlockingIO.library.run { AlbumMoveFiles.discard(copy) }
+        if !isInPlace, case .failure(let error) = await BlockingIO.library.run({
+            Result { try AlbumMoveFiles.putInPlace(staging: staging, destination: destination) }
+        }) {
+            _ = relink(commit.oldPaths, stamps: nil)
+            // The share dropped: it may have done the rename without saying so. The commit stays,
+            // to look at what's there when it's back.
+            guard await BlockingIO.library.run({ AlbumMoveFiles.isFolder(root) }) else { return .offline }
+            await BlockingIO.library.run { try? FileManager.default.removeItem(at: staging) }
+            try? setCommit(nil, of: move)
             return await moveFailed(move, root: root, error)
         }
         let bookmarks = await BlockingIO.library.run { newPaths.compactMapValues { try? URL(fileURLWithPath: $0).bookmarkData() } }
@@ -266,20 +360,34 @@ extension AppModel {
                 }
             }
         }
-        let originals = Array(oldPaths.values), downloads = downloadFolder
+        let originals = Array(commit.oldPaths.values), downloads = downloadFolder
         await BlockingIO.library.run { AlbumMoveFiles.removeOriginals(originals, folder: folder, downloads: downloads) }
 
         var moved: [String: URL] = [:]
         for (id, path) in newPaths {
-            if let old = oldPaths[id] { moved[old] = URL(fileURLWithPath: path) }
+            if let old = commit.oldPaths[id] { moved[old] = URL(fileURLWithPath: path) }
         }
         soulseek.noteMoved(moved)
         soulseek.rescanShares()
-        EventLog.shared.log("Moved “\(move.title)” to \(copy.destination.path)", level: .info)
+        EventLog.shared.log("Moved “\(move.title)” to \(destination.path)", level: .info)
         if soulseek.postsNotifications {
-            Notifier.post(title: "Moved “\(move.title)” to the library", body: copy.destination.path)
+            Notifier.post(title: "Moved “\(move.title)” to the library", body: destination.path)
         }
         return .done
+    }
+
+    /// Whether the library already points at this move's new files.
+    private func isFollowed(_ commit: AlbumMove.Commit) -> Bool {
+        let newPaths = commit.newPaths
+        return newPaths.allSatisfy { id, path in tracksByID[id].map { $0.path == path } ?? true }
+    }
+
+    /// Saves where `move` has got to, before anything acts on it. Throws if it can't be saved.
+    private func setCommit(_ commit: AlbumMove.Commit?, of move: AlbumMove) throws {
+        guard let index = queuedAlbumMoves.firstIndex(where: { $0.folder == move.folder }) else { return }
+        queuedAlbumMoves[index].commit = commit
+        guard let url = albumMovesURL else { return }
+        try AlbumMoveFiles.save(queuedAlbumMoves, to: url)
     }
 
     /// Points tracks at new paths, stamping their files (when given) so a rescan takes them as
@@ -298,8 +406,9 @@ extension AppModel {
         return true
     }
 
-    /// A move that failed. If the library folder went away meanwhile, the album waits for it;
-    /// otherwise it stays in the download folder, and the error is shown.
+    /// A move that failed before the library followed it. If the library folder went away
+    /// meanwhile, the album waits for it; otherwise it stays in the download folder, and the error
+    /// is shown.
     private func moveFailed(_ move: AlbumMove, root: URL, _ error: Error) async -> MoveOutcome {
         guard await BlockingIO.library.run({ AlbumMoveFiles.isFolder(root) }) else { return .offline }
         report("Couldn't move “\(move.title)” to the library; it stays in the download folder", error)

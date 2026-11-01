@@ -174,13 +174,22 @@ extension AppModel {
 
     // MARK: Saved tag writes
 
-    /// Picks up tag writes that were still queued when susurrus quit.
+    /// Picks up tag writes that were still queued, or waiting, when susurrus quit. With Write tags
+    /// to files off only downloads' go on: those get their tags either way.
     func restorePendingTagWrites() {
         guard let store, let pending = try? store.pendingTagWrites(), !pending.isEmpty else { return }
-        guard writesTagsToFiles else {
+        guard !writesTagsToFiles else {
+            tagWriter.resume(pending)
+            return
+        }
+        let downloads = pending.filter { isInDownloadFolder(URL(fileURLWithPath: $0.path)) }
+        guard !downloads.isEmpty else {
             try? store.clearPendingTagWrites()
             return
         }
-        tagWriter.resume(pending)
+        for write in pending where !isInDownloadFolder(URL(fileURLWithPath: write.path)) {
+            try? store.savePendingTagWrite(nil, forPath: write.path)
+        }
+        tagWriter.resume(downloads)
     }
 }

@@ -42,7 +42,8 @@ enum Diagnostics {
         }
         lines.append("Mixer: \(model.isShowingMixer ? "shown" : "hidden"), decks \(decks.joined(separator: ", "))")
         lines.append("Tags written to files: \(model.writesTagsToFiles ? "on" : "off")"
-            + (model.tagWriter.failures.isEmpty ? "" : ", \(model.tagWriter.failures.count) failed writes"))
+            + (model.tagWriter.failures.isEmpty ? "" : ", \(model.tagWriter.failures.count) failed writes")
+            + (model.tagWriter.waiting.isEmpty ? "" : ", \(model.tagWriter.waiting.count) waiting"))
         let soulseek = switch model.soulseek.state {
         case .disconnected: "not connected"
         case .connecting: "connecting"
