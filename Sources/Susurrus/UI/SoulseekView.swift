@@ -410,10 +410,19 @@ private struct DownloadRow: View, Equatable {
                 Text(download.fileName)
                     .lineLimit(1)
                     .help(download.remotePath.replacingOccurrences(of: "\\", with: " ▸ "))
-                Text("\(download.username) · \(statusText)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                // The note on when it carries on stays whole: a long reason is what gets cut off.
+                HStack(spacing: 0) {
+                    Text("\(download.username) · \(statusText)")
+                        .lineLimit(1)
+                    if let retryNote {
+                        Text(retryNote)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(statusText + (retryNote ?? ""))
             }
             Spacer()
             if case .transferring(let received, let total) = download.state {
@@ -487,12 +496,16 @@ private struct DownloadRow: View, Equatable {
         case .transferring(let received, let total):
             "\(byteCount(received)) of \(byteCount(total))"
         case .finished: "Done — added to the library"
-        case .interrupted(let reason):
-            download.retryDate.map { "\(reason) — trying again at \($0.formatted(date: .omitted, time: .shortened))" }
-                ?? "\(reason) — carries on when they're back"
-        case .failed(let reason): reason
+        case .interrupted(let reason), .failed(let reason): reason
         case .cancelled: "Cancelled"
         }
+    }
+
+    /// When an interrupted download carries on.
+    private var retryNote: String? {
+        guard case .interrupted = download.state else { return nil }
+        return download.retryDate.map { " — trying again at \($0.formatted(date: .omitted, time: .shortened))" }
+            ?? " — carries on when they're back"
     }
 }
 

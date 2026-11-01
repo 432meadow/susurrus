@@ -113,7 +113,7 @@ import Testing
             Issue.record("expected a failure, got \(String(describing: finalState))")
             return
         }
-        #expect(reason.contains("sent more"))
+        #expect(reason.contains("Sent more"))
         #expect(!FileManager.default.fileExists(atPath: request.destinationURL.path))
         try await waitUntil { !FileManager.default.fileExists(atPath: request.partURL.path) }
     }
@@ -341,7 +341,7 @@ import Testing
         var limits = SoulseekClient.Limits()
         limits.channels = 0
         let finalState = try await runDownload(downloadRequest(size: 1000, in: folder), against: mock, limits: limits)
-        #expect(finalState == .interrupted("Can't reach mockpeer"))
+        #expect(finalState == .interrupted("Can't be reached"))
     }
 
     /// A finished download never replaces a file already at its destination.

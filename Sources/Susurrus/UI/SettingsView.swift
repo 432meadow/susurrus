@@ -359,7 +359,7 @@ private struct TagWriteStatus: View {
                 Text(label).font(.caption).lineLimit(1).truncationMode(.middle)
             }
         } else if queue.total > 0 {
-            Text("Wrote tags to \(queue.written.formatted()) of \(queue.total.formatted()) files.")
+            Text("Wrote tags to \(queue.written.formatted()) of \(queue.total.formatted()) \(queue.total == 1 ? "file" : "files").")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -377,7 +377,7 @@ private struct TagWriteStatus: View {
             }
         }
         if !queue.failures.isEmpty {
-            DisclosureGroup("\(queue.failures.count) files couldn't be written") {
+            DisclosureGroup("\(queue.failures.count) \(queue.failures.count == 1 ? "file" : "files") couldn't be written") {
                 ForEach(queue.failures) { failure in
                     VStack(alignment: .leading, spacing: 2) {
                         Text((failure.path as NSString).lastPathComponent).lineLimit(1).truncationMode(.middle)
@@ -400,7 +400,7 @@ private struct TagWriteStatus: View {
             return "Waiting for “\((path as NSString).lastPathComponent)” to stop playing…"
         }
         let name = queue.currentPath.map { " — " + ($0 as NSString).lastPathComponent } ?? ""
-        return "Writing tags: \(queue.done.formatted()) of \(queue.total.formatted()) files\(name)"
+        return "Writing tags: \(queue.done.formatted()) of \(queue.total.formatted()) \(queue.total == 1 ? "file" : "files")\(name)"
     }
 }
 
