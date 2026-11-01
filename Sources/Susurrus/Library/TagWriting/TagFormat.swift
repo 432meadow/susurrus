@@ -18,8 +18,8 @@ enum TagWriteError: LocalizedError, Equatable {
         case .unsupportedTag(let what): "\(what) isn't supported"
         case .malformed(let what): "The file's tags look damaged (\(what))"
         case .verificationFailed(let what): "The rewritten copy didn't check out (\(what)); the original was left alone"
-        case .modifiedSinceRead: "The file changed while susurrus was writing it; skipped"
-        case .fileMissing: "The file isn't there (is the share mounted?)"
+        case .modifiedSinceRead: "The file kept changing while susurrus was writing it"
+        case .fileMissing: "The file isn't there"
         case .partlyWritten: "Writing the tags stopped partway and the old ones couldn't be put back; check the file"
         }
     }

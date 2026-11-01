@@ -21,6 +21,19 @@ extension SlskStream {
     }
 }
 
+// MARK: File limit
+
+/// Each connection and open file takes a descriptor, and an app starts with room for only 256:
+/// less than the client's budgets add up to.
+enum SlskFileLimit {
+    static let raised: Void = {
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0, limit.rlim_cur < 1024 else { return }
+        limit.rlim_cur = min(1024, limit.rlim_max)
+        setrlimit(RLIMIT_NOFILE, &limit)
+    }()
+}
+
 // MARK: Input buffer
 
 /// Bytes a connection has received that nobody has read yet, and the one read waiting for more.

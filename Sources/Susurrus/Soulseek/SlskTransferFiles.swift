@@ -21,10 +21,17 @@ enum SlskTransferFiles {
 
     /// Moves a finished part file to `destination` — or "name 2.ext", "name 3.ext", … when that's
     /// taken, so an existing file is never replaced — creating the folder, and marks it as
-    /// downloaded from the internet. Returns where it landed.
-    static func moveIntoPlace(_ part: URL, to destination: URL) async throws -> URL {
+    /// downloaded from the internet. Returns where it landed. A part file that isn't `expectedSize`
+    /// bytes on disk isn't the file: it's deleted, and the error says so.
+    static func moveIntoPlace(_ part: URL, to destination: URL, expectedSize: UInt64) async throws -> URL {
         try await perform {
             let fileManager = FileManager.default
+            let size = (try fileManager.attributesOfItem(atPath: part.path)[.size] as? NSNumber)?.uint64Value
+            guard size == expectedSize else {
+                try? fileManager.removeItem(at: part)
+                throw SlskError(message: "The finished file came out the wrong size")
+            }
+            SlskPartFile.forgetSize(of: part)
             try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
             for candidate in candidates(for: destination) {
                 do {
@@ -71,8 +78,30 @@ final class SlskPartFile: @unchecked Sendable {
         self.handle = handle
     }
 
+    /// Each part file notes the size of the file it's a part of, on disks that keep extended
+    /// attributes: a queue can wait for days, and bytes of a file the uploader has since changed
+    /// can't be continued with bytes of the new one.
+    private static let sizeAttribute = "io.github.432meadow.susurrus.file-size"
+
+    private static func recordedSize(of url: URL) -> UInt64? {
+        var value = [UInt8](repeating: 0, count: 32)
+        let count = getxattr(url.path, sizeAttribute, &value, value.count, 0, 0)
+        return count > 0 ? UInt64(String(decoding: value.prefix(count), as: UTF8.self)) : nil
+    }
+
+    private static func record(size: UInt64, on url: URL) {
+        let value = Array(String(size).utf8)
+        setxattr(url.path, sizeAttribute, value, value.count, 0, 0)
+    }
+
+    /// A finished file doesn't need the note.
+    static func forgetSize(of url: URL) {
+        removexattr(url.path, sizeAttribute, 0)
+    }
+
     /// Opens the part file at `url` (creating it and its folder), positioned to resume at its
-    /// current size. One larger than `expectedSize` belongs to some other file, so it's emptied.
+    /// current size. One larger than `expectedSize`, or noted as part of a file of another size,
+    /// belongs to some other file, so it's emptied.
     static func open(_ url: URL, expectedSize: UInt64) async throws -> (file: SlskPartFile, offset: UInt64) {
         try await SlskTransferFiles.perform {
             let fileManager = FileManager.default
@@ -84,11 +113,12 @@ final class SlskPartFile: @unchecked Sendable {
             }
             let handle = try FileHandle(forWritingTo: url)
             var offset = try handle.seekToEnd()
-            if offset > expectedSize {
+            if offset > expectedSize || recordedSize(of: url).map({ $0 != expectedSize }) == true {
                 try handle.truncate(atOffset: 0)
                 try handle.seek(toOffset: 0)
                 offset = 0
             }
+            record(size: expectedSize, on: url)
             return (SlskPartFile(handle: handle), offset)
         }
     }

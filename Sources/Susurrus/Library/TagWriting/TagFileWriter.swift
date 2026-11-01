@@ -36,7 +36,7 @@ enum TagFileWriter {
     /// `beforeReplace` runs after verification, just before the final modification-date check
     /// (tests use it to simulate another app touching the file).
     static func write(_ values: TagValues, to url: URL, beforeReplace: (() throws -> Void)? = nil) async throws -> Outcome {
-        guard let before = stamp(url) else { throw TagWriteError.fileMissing }
+        let before = try currentStamp(url)
         if let outcome = try patchInPlace(values, url: url, before: before, beforeReplace: beforeReplace) {
             return outcome
         }
@@ -185,6 +185,74 @@ enum TagFileWriter {
         var info = stat()
         guard stat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
         return Stamp(size: Int(info.st_size), modified: info.st_mtimespec)
+    }
+
+    /// The file's stamp, telling a file that isn't there from one that can't be reached right now.
+    private static func currentStamp(_ url: URL) throws -> Stamp {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else {
+            if errno == ENOENT || errno == ENOTDIR { throw TagWriteError.fileMissing }
+            throw posixError("Couldn't reach the file")
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else { throw TagWriteError.fileMissing }
+        return Stamp(size: Int(info.st_size), modified: info.st_mtimespec)
+    }
+
+    // MARK: After a failure
+
+    /// What to do about a write that failed.
+    enum Retry: Equatable {
+        /// It won't go any better next time.
+        case never
+        /// Soon: only this file is affected (another app was changing it).
+        case soon
+        /// Once the file's volume can be reached again.
+        case whenReachable
+    }
+
+    /// Errors a network volume gives when it has gone or stopped answering.
+    private static let unreachableErrors: Set<Int32> = [
+        ENOTCONN, ETIMEDOUT, EIO, ENETDOWN, ENETUNREACH, ENETRESET, ECONNABORTED, ECONNRESET,
+        EHOSTDOWN, EHOSTUNREACH, ENXIO, ENODEV, ESTALE, EPIPE, EAUTH, ENEEDAUTH,
+    ]
+
+    /// Blocking: it may ask whether the file's volume is mounted.
+    static func retry(after error: Error, path: String) -> Retry {
+        switch error as? TagWriteError {
+        case .modifiedSinceRead:
+            return .soon
+        case .partlyWritten:
+            return .whenReachable  // only a connection that dropped does that, and another try repairs it
+        case .fileMissing:
+            return volumeIsGone(path) ? .whenReachable : .never
+        case .some:
+            return .never
+        case nil:
+            break
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain, [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(nsError.code) {
+            return volumeIsGone(path) ? .whenReachable : .never
+        }
+        guard let code = posixCode(of: nsError) else { return .never }
+        if code == ENOENT || code == ENOTDIR { return volumeIsGone(path) ? .whenReachable : .never }
+        return unreachableErrors.contains(code) ? .whenReachable : .never
+    }
+
+    /// The POSIX error behind `error`, however deep Foundation wrapped it.
+    private static func posixCode(of error: NSError) -> Int32? {
+        if error.domain == NSPOSIXErrorDomain { return Int32(error.code) }
+        return (error.userInfo[NSUnderlyingErrorKey] as? NSError).flatMap(posixCode)
+    }
+
+    /// Whether `path` is on a volume that isn't mounted. An empty /Volumes/Music left behind by a
+    /// share that went isn't the share: what counts is that something is mounted there.
+    static func volumeIsGone(_ path: String) -> Bool {
+        guard let volume = MissingFiles.volumeRoot(of: path) else { return false }
+        var info = statfs()
+        guard statfs(volume, &info) == 0 else { return true }
+        let mountedOn = withUnsafeBytes(of: &info.f_mntonname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        return mountedOn != URL(fileURLWithPath: volume).resolvingSymlinksInPath().path
     }
 
     /// Hidden (so folder scans skip it) and keeping the extension (so AVFoundation can open it).

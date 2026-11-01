@@ -341,7 +341,9 @@ final class AppModel {
         keyAnalyzer.didDetect = { [weak self] results in self?.saveDetectedKeys(results) }
         restorePlaybackState()
         startWatchingFolders()
-        if soulseek.connectsAtLaunch, soulseek.hasCredentials { soulseek.connect() }
+        // Next to the library, so a test's throwaway library keeps a throwaway queue.
+        soulseek.restoreDownloads(from: libraryURL.deletingLastPathComponent().appendingPathComponent("Soulseek/Downloads.json"))
+        if soulseek.connectsAtLaunch || soulseek.resumesDownloadsAtLaunch, soulseek.hasCredentials { soulseek.connect() }
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.savePlaybackState()
@@ -353,13 +355,14 @@ final class AppModel {
 
         // Covers that failed while the music share was unmounted are worth retrying once it's back;
         // so are files that looked missing. Only the volume that came or went is checked. Albums
-        // waiting for the library folder try again.
+        // waiting for the library folder and tag writes waiting for their files try again.
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] notification in
             ArtworkStore.shared.forgetMisses()
             let volume = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
             MainActor.assumeIsolated {
                 self?.checkForMissingFiles(onVolume: volume)
                 self?.moveDownloadedAlbums()
+                self?.tagWriter.retryWaiting()
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] notification in

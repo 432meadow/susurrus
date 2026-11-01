@@ -57,7 +57,7 @@ private struct LibrarySettings: View {
                             model.writesTagsToFiles = on
                         }
                     }))
-                Text("Get Info edits and ratings are also written into MP3 (ID3), FLAC and M4A files, in the background. Each file is rewritten as a verified copy that then replaces the original; files changed by another app meanwhile are skipped. Ratings go into MP3 and FLAC files only. Play counts stay in susurrus.")
+                Text("Get Info edits and ratings are also written into MP3 (ID3), FLAC and M4A files, in the background. Each file is rewritten as a verified copy that then replaces the original; files changed by another app meanwhile, or on a share that dropped, are tried again later. Ratings go into MP3 and FLAC files only. Play counts stay in susurrus.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 TagWriteStatus(queue: model.tagWriter)
@@ -172,7 +172,7 @@ private struct SoulseekSettings: View {
                         .disabled(soulseek.state == .disconnected)
                 }
                 Toggle("Connect when susurrus starts", isOn: $soulseek.connectsAtLaunch)
-                Text("Searching connects automatically. Staying connected keeps your share available and lets saved searches (the wishlist) run in the background.")
+                Text("Searching connects automatically. Staying connected keeps your share available and lets saved searches (the wishlist) run in the background. Unfinished downloads also connect at launch, unless you disconnected before quitting.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -244,7 +244,7 @@ private struct SoulseekSettings: View {
                         Button("Choose…") { chooseDownloadFolder() }
                     }
                 }
-                Text("Finished downloads keep their remote folder name (so albums stay together) and are added to the library automatically.")
+                Text("Finished downloads keep their remote folder name (so albums stay together) and are added to the library automatically. Unfinished ones carry on after a lost connection and at the next launch, from where they stopped.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Toggle("Notify when a download folder finishes or a saved search finds something new", isOn: $soulseek.postsNotifications)
@@ -283,7 +283,7 @@ private struct SoulseekSettings: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             let count = soulseek.activeTransferCount
-            Text("Changing the account reconnects to Soulseek, which stops \(count == 1 ? "the transfer" : "\(count.formatted()) transfers") in progress.")
+            Text("Changing the account reconnects to Soulseek, which interrupts \(count == 1 ? "the transfer" : "\(count.formatted()) transfers") in progress. Downloads carry on afterwards.")
         }
     }
 
@@ -363,6 +363,19 @@ private struct TagWriteStatus: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        if !queue.waiting.isEmpty {
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(queue.waiting.count.formatted()) \(queue.waiting.count == 1 ? "file waits" : "files wait") for a share to come back or a file to settle. They're tried again every few minutes and at the next launch.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Try Now") { queue.retryWaiting() }
+                    .controlSize(.small)
+                Button("Forget") { queue.forgetWaiting() }
+                    .controlSize(.small)
+                    .help("The edits stay in the library, but these files won't get them")
+            }
+        }
         if !queue.failures.isEmpty {
             DisclosureGroup("\(queue.failures.count) files couldn't be written") {
                 ForEach(queue.failures) { failure in
@@ -373,7 +386,10 @@ private struct TagWriteStatus: View {
                     .font(.caption)
                     .help(failure.path)
                 }
-                Button("Clear") { queue.clearFailures() }
+                HStack {
+                    Button("Try Again") { queue.retryFailures() }
+                    Button("Clear") { queue.clearFailures() }
+                }
             }
             .font(.caption)
         }
