@@ -1,10 +1,10 @@
 import AVFoundation
-import ObjCSupport
 import Observation
 
 /// A two-deck mixer for blending tracks by hand, on its own AVAudioEngine so the queue player's
 /// gapless schedule is left alone. Only one of the two plays at a time: starting a deck pauses
-/// the queue player and vice versa (wired up in `AppModel`).
+/// the queue player and vice versa (wired up in `AppModel`), and while a mix is live the media
+/// keys are its own (see `NowPlayingCenter`).
 ///
 /// Graph per deck: player node → input mixer → varispeed (tempo) → 3-band EQ → channel mixer →
 /// main mixer → output. The input mixer converts every file to one fixed deck format, so loading a
@@ -56,18 +56,30 @@ final class Mixer {
     @ObservationIgnored var onAnalyzed: ((Track, TrackAnalysis) -> Void)?
     /// Called whenever a deck starts playing, so the queue player can pause.
     @ObservationIgnored var onStartedPlaying: (() -> Void)?
+    /// Called when what Now Playing should show about the mix may have changed.
+    @ObservationIgnored var onTransportChanged: (() -> Void)?
 
     private enum Keys {
         static let masterVolume = "mixer.masterVolume"
         static let autoFadeSeconds = "mixer.autoFadeSeconds"
     }
 
+    /// How soon after the output fails a working device still picks the decks up again.
+    private static let outputRetryWindow: TimeInterval = 10
+
     @ObservationIgnored private let engine = AVAudioEngine()
     @ObservationIgnored private let files: PlaybackFileCache
     /// What the file cache was last told the decks need.
     @ObservationIgnored private var keptTrackIDs: Set<Int64> = []
     @ObservationIgnored private var isSetUp = false
-    @ObservationIgnored private var outputDeviceUID: String?
+    /// The queue player's output, which the mixer follows.
+    @ObservationIgnored private var outputDevice: AudioDeviceID?
+    /// Decks a media key paused together, for the next one to start together.
+    @ObservationIgnored private var heldDecks: [Deck] = []
+    /// Decks that couldn't start again because the output failed, and when.
+    @ObservationIgnored private var interrupted: (decks: [Deck], at: Date)?
+    /// The deck Now Playing was last told about.
+    @ObservationIgnored private var shownLeadDeck: Deck?
     @ObservationIgnored private var fade: Task<Void, Never>?
     @ObservationIgnored private var monitor: Task<Void, Never>?
 
@@ -78,8 +90,16 @@ final class Mixer {
         masterVolume = defaults.object(forKey: Keys.masterVolume) as? Float ?? 0.8
         autoFadeSeconds = defaults.object(forKey: Keys.autoFadeSeconds) as? Double ?? 8
         for deck in decks {
-            deck.startEngine = { [weak self] in self?.startEngine() ?? false }
-            deck.didStop = { [weak self] in self?.deckStopped() }
+            // Touching a deck by hand ends any media-key pause.
+            deck.startEngine = { [weak self] in
+                self?.heldDecks = []
+                return self?.startEngine() ?? false
+            }
+            deck.didStop = { [weak self] in
+                self?.heldDecks = []
+                self?.deckStopped()
+            }
+            deck.transportChanged = { [weak self] in self?.onTransportChanged?() }
             deck.levelChanged = { [weak self] in self?.applyGains() }
             deck.playCounted = { [weak self] track in self?.onTrackPlayed?(track) }
             deck.listenEnded = { [weak self] track, listen in self?.onListenEnded?(track, listen) }
@@ -104,7 +124,10 @@ final class Mixer {
                 onUnplayable?(track)
                 return
             }
-            guard connect(deck, for: file.processingFormat) else {
+            do {
+                try connect(deck, for: file.processingFormat)
+            } catch {
+                EventLog.shared.log("Mixer: the engine refused \(file.processingFormat): \(error.localizedDescription)")
                 deck.failLoading("Unsupported audio format")
                 return
             }
@@ -119,7 +142,36 @@ final class Mixer {
     }
 
     func pauseAll() {
+        heldDecks = []
+        interrupted = nil
         for deck in decks { deck.pause() }
+    }
+
+    // MARK: Media keys
+
+    var isPlaying: Bool { a.isPlaying || b.isPlaying }
+
+    /// A deck is playing, or a media key paused the mix and the next one starts it again: either
+    /// way the keys and Now Playing are the mixer's, not the queue player's.
+    var isLive: Bool { isPlaying || !heldDecks.isEmpty }
+
+    /// What the media keys' Play/Pause does to a live mix.
+    func toggleLive() {
+        if isPlaying {
+            let playing = decks.filter(\.isPlaying)
+            pauseAll()
+            heldDecks = playing
+        } else {
+            let held = heldDecks
+            heldDecks = []
+            startTogether(held)
+        }
+        onTransportChanged?()
+    }
+
+    /// What Now Playing shows while the mix is live: the deck that's most in it.
+    var leadDeck: Deck? {
+        (isPlaying ? decks.filter(\.isPlaying) : heldDecks).max { $0.channel.outputVolume < $1.channel.outputVolume }
     }
 
     /// Ends both decks' listens as stopped, for when susurrus quits.
@@ -190,21 +242,40 @@ final class Mixer {
         // Squared so the channel fader feels even across its travel, like an audio-taper fader.
         a.channel.outputVolume = a.level * a.level * gainA
         b.channel.outputVolume = b.level * b.level * gainB
+        if leadDeck !== shownLeadDeck {
+            shownLeadDeck = leadDeck
+            onTransportChanged?()
+        }
     }
 
     // MARK: Output device
 
-    /// nil follows the system default output. Follows the queue player's choice.
-    func setOutputDevice(_ uid: String?) {
-        outputDeviceUID = uid
-        guard isSetUp else { return }
-        let device = uid.flatMap(OutputDevices.deviceID(forUID:)) ?? OutputDevices.defaultOutputDeviceID()
-        guard let device else { return }
+    /// Follows the queue player's output: the decks that are playing carry on there.
+    func setOutputDevice(_ device: AudioDeviceID?) {
+        outputDevice = device
+        guard isSetUp, let device else { return }
+        let failed = interrupted.flatMap { Date().timeIntervalSince($0.at) < Mixer.outputRetryWindow ? $0.decks : nil } ?? []
+        let moved = device != engine.outputDevice
+        guard moved || !failed.isEmpty else { return }
+        interrupted = nil
         let playing = decks.filter(\.isPlaying)
         for deck in playing { deck.pause(notify: false) }
-        engine.stop()
-        engine.setOutputDevice(device)
-        for deck in playing { deck.play() }
+        if moved {
+            engine.stop()
+            engine.setOutputDevice(device)
+        }
+        startTogether(playing + failed)
+    }
+
+    /// Starts `decks` from where they are, at the same moment so a beat-matched pair stays matched.
+    private func startTogether(_ decks: [Deck]) {
+        guard !decks.isEmpty else { return }
+        guard startEngine() else {
+            interrupted = (decks, Date())
+            return
+        }
+        let moment = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.05))
+        for deck in decks { deck.play(at: moment) }
     }
 
     // MARK: Engine
@@ -213,9 +284,7 @@ final class Mixer {
     private func setUpIfNeeded() {
         guard !isSetUp else { return }
         isSetUp = true
-        if let uid = outputDeviceUID, let device = OutputDevices.deviceID(forUID: uid) {
-            engine.setOutputDevice(device)
-        }
+        if let outputDevice { engine.setOutputDevice(outputDevice) }
         let rate = engine.outputNode.outputFormat(forBus: 0).sampleRate
         let format = AVAudioFormat(standardFormatWithSampleRate: rate > 0 ? rate : 44_100, channels: 2)!
         for deck in decks {
@@ -233,7 +302,9 @@ final class Mixer {
         // Pick up where the decks were, on the new device.
         engine.onConfigurationChange { [weak self] in
             guard let self else { return }
-            for deck in self.decks where deck.isPlaying { deck.restart() }
+            let playing = self.decks.filter(\.isPlaying)
+            for deck in playing { deck.pause(notify: false) }
+            self.startTogether(playing)
         }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
@@ -243,20 +314,16 @@ final class Mixer {
         }
     }
 
-    /// Returns false if the engine can't take this format (it raises an NSException, caught in ObjC).
-    private func connect(_ deck: Deck, for format: AVAudioFormat) -> Bool {
+    /// Connects a deck's player node for a file in `format`, unless the engine won't have it.
+    private func connect(_ deck: Deck, for format: AVAudioFormat) throws {
         if let connected = deck.connectedFormat,
            connected.sampleRate == format.sampleRate, connected.channelCount == format.channelCount {
-            return true
+            return
         }
         engine.disconnectNodeOutput(deck.node)
-        var error: NSError?
-        guard MMConnectNodes(engine, deck.node, deck.input, format, &error) else {
-            deck.connectedFormat = nil
-            return false
-        }
+        deck.connectedFormat = nil
+        try engine.connectChecked(deck.node, to: deck.input, format: format)
         deck.connectedFormat = format
-        return true
     }
 
     private func startEngine() -> Bool {
@@ -301,11 +368,14 @@ final class Mixer {
 final class Deck {
     let side: Mixer.Side
 
-    private(set) var track: Track?
+    private(set) var track: Track? {
+        didSet { transportChanged() }
+    }
     private(set) var isLoading = false
     private(set) var isPlaying = false {
         // Each change books the listening time under the state that's ending.
-        willSet { listen?.update(audible: isPlaying) }
+        willSet { listen?.update(audible: isPlaying, clock: node.renderedSeconds) }
+        didSet { transportChanged() }
     }
     private(set) var errorMessage: String?
     /// Loudness overview and beat grid, once the file has been read through (nil until then).
@@ -340,6 +410,7 @@ final class Deck {
     @ObservationIgnored fileprivate var levelChanged: () -> Void = {}
     @ObservationIgnored fileprivate var playCounted: (Track) -> Void = { _ in }
     @ObservationIgnored fileprivate var listenEnded: (Track, ListenRecord) -> Void = { _, _ in }
+    @ObservationIgnored fileprivate var transportChanged: () -> Void = {}
     /// Bumped per load or eject, so a slow load that's been replaced is dropped.
     @ObservationIgnored fileprivate private(set) var loadToken = 0
     /// The load under way: cancelled when it's replaced, so a copy nobody needs can stop.
@@ -354,7 +425,9 @@ final class Deck {
     /// engine has stopped (and its clock with it) before we hear about it.
     @ObservationIgnored private var lastPlayheadFrame: AVAudioFramePosition = 0
     /// Observed, so a seek while paused redraws whatever shows the position.
-    private var pausedFrame: AVAudioFramePosition = 0
+    private var pausedFrame: AVAudioFramePosition = 0 {
+        didSet { transportChanged() }
+    }
     /// The loaded track's listen so far: from its first play until the deck moves on.
     @ObservationIgnored private var listen: ListenSession?
     @ObservationIgnored private var reachedEndOnce = false
@@ -428,13 +501,14 @@ final class Deck {
 
     // MARK: Transport
 
-    func play() {
+    /// `moment`: when the audio starts, if not at once.
+    func play(at moment: AVAudioTime? = nil) {
         guard let file, let track, !isPlaying, startEngine() else { return }
         if listen == nil { listen = ListenSession(track) }
         // At the end, play again from the cue point.
         let from = pausedFrame >= file.length - 1 ? frame(for: cuePoint) : pausedFrame
         schedule(from: from)
-        node.play()
+        node.play(at: moment)
         isPlaying = true
     }
 
@@ -547,18 +621,11 @@ final class Deck {
         lastPlayheadFrame = currentFrame
     }
 
-    /// Reschedules at the current position, after the engine stopped underneath us.
-    fileprivate func restart() {
-        guard isPlaying else { return }
-        pause(notify: false)
-        play()
-    }
-
     // MARK: Listens
 
     /// Counts the loaded track as played, once, when enough of it has been heard.
     fileprivate func countPlayIfDue() {
-        listen?.update(audible: isPlaying)
+        listen?.update(audible: isPlaying, clock: node.renderedSeconds)
         if listen?.takePlay(duration: duration) == true, let track = listen?.track { playCounted(track) }
     }
 
@@ -574,6 +641,13 @@ final class Deck {
         if let record = ended.record(outcome, at: currentTime) { listenEnded(ended.track, record) }
     }
 
+    /// Takes over the queue player's listen (Continue in Mixer) in place of any just begun here.
+    func continueListen(_ handedOver: ListenSession?) {
+        guard var handedOver else { return }
+        handedOver.update(audible: false, clock: node.renderedSeconds)
+        listen = handedOver
+    }
+
     // MARK: Scheduling
 
     private func frame(for seconds: TimeInterval) -> AVAudioFramePosition {
@@ -584,8 +658,8 @@ final class Deck {
 
     private func halt() {
         generation += 1
+        isPlaying = false  // first: it reads the node's clock, which stopping it ends
         node.stop()
-        isPlaying = false
     }
 
     private func schedule(from frame: AVAudioFramePosition) {
@@ -612,5 +686,6 @@ final class Deck {
 
     private func applyRate() {
         varispeed.rate = Float(playbackRate)
+        transportChanged()
     }
 }

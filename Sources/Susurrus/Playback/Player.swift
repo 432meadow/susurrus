@@ -1,5 +1,4 @@
 import AVFoundation
-import ObjCSupport
 import Observation
 
 /// Queue-based player on AVAudioEngine.
@@ -13,7 +12,14 @@ import Observation
 /// - The engine only runs while there's something to hear. A running output keeps the Mac (and
 ///   Bluetooth or AirPlay speakers) awake, so a paused player lets it go after `engineIdleDelay`,
 ///   and a queue restored at launch doesn't start it at all.
-/// - Graph: player node → 10-band EQ → main mixer → output device.
+/// - Graph: player node → input mixer → 10-band EQ → main mixer → output device. From the input
+///   mixer on, everything runs at one format, stereo at the output's sample rate, because the EQ
+///   can't change format while the engine runs. The node puts out stereo at the rate of the track
+///   it started on, and converts any other mono or stereo file to that itself, so any such track
+///   can chain onto any other. Tracks at the node's rate join exactly, with one continuous
+///   conversion in the mixer; one at another rate is converted twice until the next fresh start.
+///   The node would just drop further channels, so a surround file connects in its own format for
+///   the mixer to mix down: only those start with a short gap, next to a track in another format.
 @MainActor
 @Observable
 final class Player {
@@ -57,6 +63,8 @@ final class Player {
     private(set) var shuffle = false
     /// How many tracks right after the current one were added with Play Next / Add to Queue.
     private(set) var queuedAheadCount = 0
+    /// The device playing, for the output menus: nil is the system output, which is also what plays
+    /// while a chosen device is away.
     private(set) var outputDeviceUID: String?
     var repeatMode: RepeatMode = .off {
         didSet {
@@ -135,13 +143,15 @@ final class Player {
     @ObservationIgnored var onListenEnded: ((Track, ListenRecord) -> Void)?
     /// Called whenever playback starts or resumes, so the mixer's decks can pause.
     @ObservationIgnored var onStartedPlaying: (() -> Void)?
-    /// Called when the user picks another output device (nil: the system output).
-    @ObservationIgnored var onOutputDeviceChanged: ((String?) -> Void)?
+    /// Called with the device the output is on whenever it might have moved, so the mixer can follow.
+    @ObservationIgnored var onOutputChanged: ((AudioDeviceID?) -> Void)?
     /// How long the engine keeps running while paused before it lets the output device go.
     @ObservationIgnored var engineIdleDelay: Duration = .seconds(20)
 
     /// Whether the audio engine, and with it the output device, is running.
     var isEngineRunning: Bool { engine.isRunning }
+    /// The device the output is on.
+    var outputDevice: AudioDeviceID? { engine.outputDevice }
 
     private enum Keys {
         static let volume = "player.volume"
@@ -181,11 +191,23 @@ final class Player {
     private static let prefetchLeadTime: TimeInterval = 60
     /// Files in a row that won't open before the share is taken to be gone.
     private static let maxConsecutiveFailures = 3
+    /// How soon after the output fails a working device still picks playback up again. Not much
+    /// later: a device plugged in hours from now shouldn't start the music.
+    private static let outputRetryWindow: TimeInterval = 10
 
     @ObservationIgnored private let files: PlaybackFileCache
     @ObservationIgnored private let engine = AVAudioEngine()
     @ObservationIgnored private let node = AVAudioPlayerNode()
+    @ObservationIgnored private let input = AVAudioMixerNode()
+    /// The format everything from the input mixer on runs at; nil once the output has moved on from it.
+    @ObservationIgnored private var graphFormat: AVAudioFormat?
+    /// The format the node is connected in.
     @ObservationIgnored private var connectedFormat: AVAudioFormat?
+    /// The device picked in the output menu (nil: the system output). Kept, and saved, while it's
+    /// away, so playback goes back to it when it returns.
+    @ObservationIgnored private var chosenOutputUID: String?
+    /// When the output last refused to start under playback.
+    @ObservationIgnored private var outputFailedAt: Date?
     /// Bumped whenever the node's schedule is torn down, so stale callbacks and loads are ignored.
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var scheduleCounter = 0
@@ -220,7 +242,7 @@ final class Player {
     @ObservationIgnored private var unshuffledOrder: [Int]?
     @ObservationIgnored private var engineRelease: Task<Void, Never>?
     @ObservationIgnored private var monitor: Task<Void, Never>?
-    @ObservationIgnored private var nowPlaying: NowPlayingCenter?
+    @ObservationIgnored private(set) var nowPlaying: NowPlayingCenter?
 
     /// `files`: the shared cache when nil (tests pass their own).
     init(files: PlaybackFileCache? = nil) {
@@ -229,17 +251,17 @@ final class Player {
         volume = defaults.object(forKey: Keys.volume) as? Float ?? 0.8
         repeatMode = RepeatMode(rawValue: defaults.string(forKey: Keys.repeatMode) ?? "") ?? .off
         shuffle = defaults.bool(forKey: Keys.shuffle)
-        outputDeviceUID = defaults.string(forKey: Keys.outputDevice)
+        chosenOutputUID = defaults.string(forKey: Keys.outputDevice)
 
         engine.attach(node)
+        engine.attach(input)
         engine.attach(equalizer.unit)
         engine.mainMixerNode.outputVolume = volume
-        if let uid = outputDeviceUID, let device = OutputDevices.deviceID(forUID: uid) {
-            engine.setOutputDevice(device)
-        }
+        routeOutput()
 
         // Rebuild the schedule at the same position on the new device.
         engine.onConfigurationChange { [weak self] in self?.outputConfigurationChanged() }
+        outputs.onChange = { [weak self] in self?.routeOutput() }
 
         monitor = Task { [weak self] in
             while !Task.isCancelled {
@@ -284,6 +306,7 @@ final class Player {
             state = .paused(position: position, resumable: false)
         case .playing:
             let position = currentTime
+            accumulateListen()  // while the node's clock still reads
             node.pause()
             state = .paused(position: position, resumable: true)
         case .paused(let position, let resumable):
@@ -300,6 +323,7 @@ final class Player {
     }
 
     func pause() {
+        outputFailedAt = nil  // it's paused on purpose now, whatever the output does
         if isPlaying { togglePlayPause() }
     }
 
@@ -339,6 +363,7 @@ final class Player {
         currentFile = nil
         nextFile = nil
         failureRun = nil
+        outputFailedAt = nil
         queuedAheadCount = 0
         keepFiles()
         nowPlaying?.update()
@@ -515,22 +540,52 @@ final class Player {
 
     /// nil follows the system default output.
     func setOutputDevice(_ uid: String?) {
-        outputDeviceUID = uid
+        chosenOutputUID = uid
         UserDefaults.standard.set(uid, forKey: Keys.outputDevice)
-        onOutputDeviceChanged?(uid)
-        let device = uid.flatMap(OutputDevices.deviceID(forUID:)) ?? OutputDevices.defaultOutputDeviceID()
-        guard let device else { return }
+        routeOutput()
+    }
+
+    /// Puts the engine on the chosen device or, if none is chosen or it's away, the system's default,
+    /// carrying on from the same spot. Runs whenever any of those might have changed, and restarts
+    /// nothing if they haven't. Returns whether it restarted playback.
+    @discardableResult
+    private func routeOutput() -> Bool {
+        let chosen = chosenOutputUID.flatMap(OutputDevices.deviceID(forUID:))
         let position = currentTime
-        let wasPlaying = isPlaying
-        engine.stop()
-        engine.setOutputDevice(device)
-        connectedFormat = nil
+        let isRetrying = outputFailedAt.map { Date().timeIntervalSince($0) < Player.outputRetryWindow } ?? false
+        let wasPlaying = isPlaying || isRetrying
+        var active: AudioDeviceID?
+        var moved = false
+        for device in [chosen, outputs.systemDefault()].compactMap({ $0 }) {
+            if device == engine.outputDevice {
+                active = device
+                break
+            }
+            engine.stop()
+            moved = true
+            if engine.setOutputDevice(device) {
+                active = device
+                break
+            }
+        }
+
+        let uid = active != nil && active == chosen ? chosenOutputUID : nil
+        if uid != outputDeviceUID, chosenOutputUID != nil {
+            let news = uid == nil ? "the chosen output device is away, playing through the system output" : "playing through the chosen output device"
+            EventLog.shared.log("Player: \(news)", level: .info)
+        }
+        outputDeviceUID = uid
+        onOutputChanged?(active)
+
+        guard moved || isRetrying else { return false }
+        graphFormat = nil
         restart(from: position, paused: !wasPlaying)
+        return true
     }
 
     private func outputConfigurationChanged() {
-        connectedFormat = nil  // force a reconnect to the new output
-        resync()
+        graphFormat = nil  // force a reconnect to the new output
+        if !routeOutput() { resync() }
     }
 
     // MARK: Time
@@ -552,9 +607,10 @@ final class Player {
     private var playheadTime: TimeInterval? {
         guard engine.isRunning, let file = currentFile?.file, let nodeTime = node.lastRenderTime,
               let playerTime = node.playerTime(forNodeTime: nodeTime) else { return nil }
-        // The clock reads a little before the start until the node's first render after play.
-        let frames = currentStartFrame + max(0, playerTime.sampleTime - currentStartSampleTime)
-        return min(Double(frames) / file.processingFormat.sampleRate, duration)
+        // The clock reads a little before the start until the node's first render after play. It
+        // counts at the node's rate, whatever the file's.
+        let played = Double(max(0, playerTime.sampleTime - currentStartSampleTime)) / playerTime.sampleRate
+        return min(Double(currentStartFrame) / file.processingFormat.sampleRate + played, duration)
     }
 
     /// Audio is coming out: not paused, loading or waiting for the share.
@@ -686,8 +742,10 @@ final class Player {
     private func begin(_ opened: PlaybackFile, at newIndex: Int, fromSeconds: TimeInterval, startPaused: Bool) {
         resetNode()
         let file = opened.file
-        guard connect(for: file.processingFormat) else {
-            errorMessage = "Unsupported audio format: \(file.processingFormat)"
+        do {
+            try connect(for: file.processingFormat)
+        } catch {
+            errorMessage = "Unsupported audio format: \(file.processingFormat): \(error.localizedDescription)"
             currentFile = nil
             loadFailed(at: newIndex, position: fromSeconds, paused: startPaused)
             return
@@ -710,6 +768,7 @@ final class Player {
             state = .paused(position: startTime, resumable: false)
             return
         }
+        startListenIfNeeded()
 
         // Over the network share the node can sit silent for a while after a seek, waiting for
         // data at the new offset. Schedule a short probe segment first: the moment its audio has
@@ -748,6 +807,8 @@ final class Player {
     /// Carries on from a pause: the engine first (it may have been let go), then the node.
     private func resume(at position: TimeInterval) {
         guard startEngine() else { return }
+        errorMessage = nil
+        startListenIfNeeded()
         node.play()
         lastPlayheadTime = position
         state = .playing
@@ -770,9 +831,11 @@ final class Player {
         guard !engine.isRunning else { return true }
         do {
             try engine.start()
+            outputFailedAt = nil
             return true
         } catch {
             errorMessage = "Audio output failed: \(error.localizedDescription)"
+            outputFailedAt = Date()
             return false
         }
     }
@@ -793,6 +856,7 @@ final class Player {
 
     /// Throws away everything scheduled on the node; completions still on their way are ignored.
     private func resetNode() {
+        accumulateListen()  // while the node's clock still reads
         generation += 1
         node.stop()
         currentScheduleID = nil
@@ -813,25 +877,45 @@ final class Player {
         }
     }
 
-    /// Returns false if the engine can't play this format (it raises an NSException, caught in ObjC).
-    private func connect(for format: AVAudioFormat) -> Bool {
-        guard !Player.sameLayout(connectedFormat, format) else { return true }
+    /// Readies the graph for a file in `format`, unless the engine won't have it.
+    private func connect(for format: AVAudioFormat) throws {
+        try connectGraph()
+        let wanted = Player.nodeFormat(for: format)
+        guard wanted != connectedFormat else { return }
         engine.disconnectNodeOutput(node)
-        engine.disconnectNodeOutput(equalizer.unit)
-        // The mixer converts to the output device's rate.
-        var error: NSError?
-        guard MMConnectNodes(engine, node, equalizer.unit, format, &error),
-              MMConnectNodes(engine, equalizer.unit, engine.mainMixerNode, format, &error) else {
-            connectedFormat = nil
-            return false
-        }
-        connectedFormat = format
-        return true
+        connectedFormat = nil
+        try engine.connectStoppingIfRefused(node, to: input, format: wanted)
+        connectedFormat = wanted
     }
 
-    private static func sameLayout(_ a: AVAudioFormat?, _ b: AVAudioFormat) -> Bool {
-        guard let a else { return false }
-        return a.sampleRate == b.sampleRate && a.channelCount == b.channelCount
+    /// Connects up everything after the node, if the output has moved on since (the main mixer
+    /// would convert, but at the output's own rate nothing has to).
+    private func connectGraph() throws {
+        let outputRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        if let graphFormat, engine.isRunning || graphFormat.sampleRate == outputRate { return }
+        let graph = AVAudioFormat(standardFormatWithSampleRate: outputRate > 0 ? outputRate : 44_100, channels: 2)!
+        engine.stop()  // the EQ can't change format while it runs
+        engine.disconnectNodeOutput(node)
+        engine.disconnectNodeOutput(input)
+        engine.disconnectNodeOutput(equalizer.unit)
+        connectedFormat = nil
+        graphFormat = nil
+        try engine.connectChecked(input, to: equalizer.unit, format: graph)
+        try engine.connectChecked(equalizer.unit, to: engine.mainMixerNode, format: graph)
+        graphFormat = graph
+    }
+
+    /// What the node puts out when it starts on a file in `format`. Never under CD rate, since the
+    /// tracks chained after this one go through it too.
+    private static func nodeFormat(for format: AVAudioFormat) -> AVAudioFormat {
+        guard format.channelCount <= 2 else { return format }
+        return AVAudioFormat(standardFormatWithSampleRate: max(format.sampleRate, 44_100), channels: 2)!
+    }
+
+    /// Whether a file in `format` can follow on the node as it's connected now.
+    private func canChain(_ format: AVAudioFormat) -> Bool {
+        guard let connectedFormat else { return false }
+        return connectedFormat.channelCount <= 2 ? format.channelCount <= 2 : format == connectedFormat
     }
 
     private func schedule(_ file: AVAudioFile, from frame: AVAudioFramePosition, frames: AVAudioFrameCount) -> Int {
@@ -875,7 +959,7 @@ final class Player {
         }
 
         if isPlaying, chainedScheduleID == nil, let prepared = nextFile,
-           Player.sameLayout(connectedFormat, prepared.opened.file.processingFormat),
+           canChain(prepared.opened.file.processingFormat),
            duration - currentTime < Player.chainLeadTime {
             chainedScheduleID = schedule(prepared.opened.file, from: 0, frames: AVAudioFrameCount(prepared.opened.file.length))
         }
@@ -926,7 +1010,9 @@ final class Player {
 
         if let chained = chainedScheduleID, let prepared = nextFile {
             // Already playing gaplessly; just advance our bookkeeping.
-            currentStartSampleTime += current.file.length - currentStartFrame
+            let fileRate = current.file.processingFormat.sampleRate
+            let frames = Double(current.file.length - currentStartFrame) * (connectedFormat?.sampleRate ?? fileRate) / fileRate
+            currentStartSampleTime += AVAudioFramePosition(frames.rounded())
             currentStartFrame = 0
             lastPlayheadTime = 0
             currentFile = prepared.opened
@@ -952,7 +1038,12 @@ final class Player {
     /// Books the time since the last call, if audio was coming out. Called before every state
     /// change, so the state now is the state since the last call.
     private func accumulateListen() {
-        listen?.update(audible: isAudible)
+        listen?.update(audible: isAudible, clock: node.renderedSeconds)
+    }
+
+    /// A paused player can have handed its listen over to a deck, or ended it.
+    private func startListenIfNeeded() {
+        if listen == nil, let currentTrack { listen = ListenSession(currentTrack) }
     }
 
     /// Counts the current entry as played once enough of it has been heard.
@@ -971,6 +1062,14 @@ final class Player {
     /// Ends the current listen as stopped, for when susurrus quits.
     func endCurrentListen() {
         endListen(.stopped)
+    }
+
+    /// Lets go of the current listen, for a deck to carry on with: heard partly here and partly on
+    /// the deck, it's still one listen and at most one play.
+    func handOverListen() -> ListenSession? {
+        countPlayIfDue()
+        defer { listen = nil }
+        return listen
     }
 
     /// Call after any change to the queue, shuffle or repeat.

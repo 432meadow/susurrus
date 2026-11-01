@@ -61,21 +61,25 @@ import Testing
 
     // MARK: Queue
 
-    @Test func playsThroughQueueGaplesslyAndCountsPlays() async {
+    @Test func playsThroughQueueGaplesslyAndCountsPlays() async throws {
         let player = makePlayer()
         var played: [Int64] = []
         player.onTrackPlayed = { played.append($0.id) }
-        player.play(Array(tracks.prefix(3)), startingAt: 0)
+        let queue = try await joining(from: 40, formats: [(44_100, 2), (44_100, 2), (44_100, 2)])
+        player.play(queue, startingAt: 0)
         #expect(await waitUntil { player.isPlaying && !player.isLoading })
-        let start = Date()
+        let recording = AudioRecording()
+        recording.start(on: player.equalizer.unit)
 
-        #expect(await waitUntil { player.currentTrack?.id == 2 })
-        #expect(await waitUntil { player.currentTrack?.id == 3 })
+        #expect(await waitUntil { player.currentTrack?.id == 41 })
+        #expect(await waitUntil { player.currentTrack?.id == 42 })
         #expect(await waitUntil { player.currentTrack == nil }, "stops at the end of the queue")
-        let elapsed = Date().timeIntervalSince(start)
-        // Three 1-second files back to back. Restarting the node per track would add a gap each time.
-        #expect(elapsed < 3.5, "took \(elapsed)s for 3s of audio")
-        #expect(played == [1, 2, 3])
+        recording.stop(on: player.equalizer.unit)
+        #expect(played == [40, 41, 42])
+        // Three seconds of one sine: restarting the node per track would add a gap each time.
+        let heard = recording.toneContinuity()
+        #expect(heard.seconds > 2.5, "heard \(heard.seconds)s")
+        #expect(heard.slipInSamples < 2, "the sine slips \(heard.slipInSamples) samples")
         player.stop()
     }
 
@@ -161,6 +165,145 @@ import Testing
         #expect(await waitUntil { player.currentTrack?.id == 2 })
         player.repeatMode = .off
         player.stop()
+    }
+
+    // MARK: Formats
+
+    /// A track whose file is a 100 Hz tone in whole cycles, so tracks in any formats join up into
+    /// one unbroken sine, and a gap between them shows as a slip in its phase.
+    private func joining(_ id: Int64, sampleRate: Double = 44_100, channels: AVAudioChannelCount = 2,
+                         seconds: Double = 1) async throws -> Track {
+        let url = folder.appendingPathComponent("\(id).wav")
+        try await ToneFile.make(at: url, seconds: seconds, frequency: AudioRecording.toneFrequency, sampleRate: sampleRate, channels: channels)
+        let track = Track(id: id)
+        track.title = "Tone \(id)"
+        track.path = url.path
+        track.length = seconds
+        return track
+    }
+
+    /// Tracks made by `joining`, with ids from `firstID`.
+    private func joining(from firstID: Int64, formats: [(Double, AVAudioChannelCount)], seconds: Double = 1) async throws -> [Track] {
+        var tracks: [Track] = []
+        for (offset, format) in formats.enumerated() {
+            tracks.append(try await joining(firstID + Int64(offset), sampleRate: format.0, channels: format.1, seconds: seconds))
+        }
+        return tracks
+    }
+
+    /// What the installed app's log called "Unsupported audio format": any track started while the
+    /// engine runs, in another sample rate or channel count than the last.
+    @Test func aTrackInAnotherFormatPlaysWhileTheEngineRuns() async throws {
+        let player = makePlayer()
+        let queue = try await joining(from: 50, formats: [(44_100, 2), (48_000, 2), (96_000, 2), (44_100, 1), (48_000, 6), (22_050, 2)], seconds: 3)
+        player.play(queue, startingAt: 0)
+        for track in queue {
+            #expect(await waitUntil { player.currentTrack?.id == track.id && player.isPlaying && player.currentTime > 0.2 }, "\(track.id) plays")
+            #expect(player.errorMessage == nil, "\(player.errorMessage ?? "")")
+            #expect(player.isEngineRunning)
+            if track.id != queue.last?.id { player.next() }
+        }
+        player.stop()
+    }
+
+    @Test func chainsAcrossSampleRatesAndChannelCountsWithoutAGap() async throws {
+        let player = makePlayer()
+        var played: [Int64] = []
+        player.onTrackPlayed = { played.append($0.id) }
+        let queue = try await joining(from: 60, formats: [(44_100, 2), (48_000, 2), (96_000, 2), (44_100, 1), (22_050, 2), (192_000, 2), (44_100, 2)])
+        let recording = AudioRecording()
+
+        player.play(queue, startingAt: 0)
+        #expect(await waitUntil { player.isPlaying && !player.isLoading })
+        recording.start(on: player.equalizer.unit)
+        #expect(await waitUntil { player.currentTrack == nil })
+        recording.stop(on: player.equalizer.unit)
+
+        #expect(player.errorMessage == nil, "\(player.errorMessage ?? "")")
+        #expect(played == queue.map(\.id))
+        let heard = recording.toneContinuity()
+        #expect(heard.seconds > 5.5, "heard \(heard.seconds)s")
+        // At the output's rate a sample is ~20 µs, so this is under 40 µs out at any join.
+        #expect(heard.slipInSamples < 2, "the sine slips \(heard.slipInSamples) samples")
+        #expect(heard.quietestAmplitude > 0.19, "the tone drops to \(heard.quietestAmplitude)")
+    }
+
+    /// Whatever the output's rate, a join between two tracks at one rate is as if they were one
+    /// file: the node converts nothing, and the mixer's conversion runs straight through it.
+    @Test func aJoinAtOneRateIsExact() async throws {
+        let player = makePlayer()
+        var tracks: [Track] = []
+        for id in Int64(76)...77 {
+            let url = folder.appendingPathComponent("\(id).wav")
+            // A higher tone than the others': any fault at the join grows with the frequency.
+            try await ToneFile.make(at: url, seconds: 1, frequency: 1_000)
+            let track = Track(id: id)
+            track.path = url.path
+            tracks.append(track)
+        }
+        player.play(tracks, startingAt: 0)
+        #expect(await waitUntil { player.isPlaying && !player.isLoading })
+        let recording = AudioRecording()
+        recording.start(on: player.equalizer.unit)
+        #expect(await waitUntil { player.currentTrack == nil })
+        recording.stop(on: player.equalizer.unit)
+        let heard = recording.toneContinuity(frequency: 1_000)
+        #expect(heard.seconds > 1.5, "heard \(heard.seconds)s")
+        #expect(heard.slipInSamples < 0.1)
+        // The node converting would make this about 0.001, on a tone 0.2 high.
+        #expect(heard.worstDeviation < 0.0002, "strays \(heard.worstDeviation)")
+    }
+
+    @Test func aMonoTrackComesOutOfBothSpeakers() async throws {
+        let player = makePlayer()
+        player.play([try await joining(70, channels: 1, seconds: 2)], startingAt: 0)
+        #expect(await waitUntil { player.isPlaying && !player.isLoading })
+        let recording = AudioRecording()
+        recording.start(on: player.equalizer.unit)
+        #expect(await waitUntil { player.currentTrack == nil })
+        recording.stop(on: player.equalizer.unit)
+        #expect(abs(recording.toneContinuity(channel: 0).quietestAmplitude - 0.2) < 0.01)
+        #expect(abs(recording.toneContinuity(channel: 1).quietestAmplitude - 0.2) < 0.01)
+    }
+
+    @Test func aSurroundTrackIsMixedDownNotCutDown() async throws {
+        // Only the centre channel sounds: a player that just took the first two would be silent.
+        let url = folder.appendingPathComponent("71.wav")
+        try await ToneFile.make(at: url, seconds: 2, frequency: AudioRecording.toneFrequency, sampleRate: 48_000, channels: 6, onlyChannel: 2)
+        let surround = Track(id: 71)
+        surround.path = url.path
+        let player = makePlayer()
+        // Between stereo tracks, so it takes rewiring both ways with the engine running.
+        player.play([try await joining(72), surround, try await joining(73)], startingAt: 0)
+        #expect(await waitUntil { player.currentTrack?.id == 71 && !player.isLoading })
+        let recording = AudioRecording()
+        recording.start(on: player.equalizer.unit)
+        #expect(await waitUntil { player.currentTrack?.id == 73 })
+        recording.stop(on: player.equalizer.unit)
+        #expect(recording.toneContinuity(channel: 0).quietestAmplitude > 0.1)
+        #expect(recording.toneContinuity(channel: 1).quietestAmplitude > 0.1)
+        #expect(await waitUntil { player.currentTrack == nil })
+        #expect(player.errorMessage == nil, "\(player.errorMessage ?? "")")
+    }
+
+    @Test func theClockAndTheListenKeepTimeAcrossAChainToAnotherRate() async throws {
+        let player = makePlayer()
+        var listens: [ListenRecord] = []
+        player.onListenEnded = { listens.append($1) }
+        player.play([try await joining(74, seconds: 2), try await joining(75, sampleRate: 96_000, seconds: 3)], startingAt: 0)
+        #expect(await waitUntil { player.currentTrack?.id == 75 })
+        let start = Date()
+        #expect(player.currentTime < 0.3, "starts from the top, at \(player.currentTime)")
+        try? await Task.sleep(for: .seconds(1.2))
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(abs(player.currentTime - elapsed) < 0.25, "at \(player.currentTime) after \(elapsed)s")
+        #expect(abs(player.duration - 3) < 0.01)
+        player.seek(to: 0.4)
+        #expect(await waitUntil { player.currentTime > 0.5 })
+        #expect(player.currentTime < 1)
+        player.stop()
+        #expect(listens.map(\.trackID) == [74, 75])
+        #expect((1.7...2.4).contains(listens.first?.seconds ?? 0), "\(listens)")
     }
 
     // MARK: Pausing and seeking
@@ -252,6 +395,97 @@ import Testing
         #expect(played.isEmpty, "the playhead is past halfway, but under a second has been heard")
         #expect(await waitUntil { player.currentTrack == nil })
         #expect(played.isEmpty, "reaching the end after skipping most of it isn't a play either")
+    }
+
+    /// An hour's sleep in the middle of a listen: the Date moves on, the audio clock doesn't.
+    @Test func aSleepGapIsntListening() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        let track = Track(id: 1)
+        var session = ListenSession(track, now: start)
+        session.update(audible: true, clock: 0, now: start)
+        session.update(audible: true, clock: 2, now: start.addingTimeInterval(2))
+        session.update(audible: true, clock: 2.1, now: start.addingTimeInterval(3602))
+        let isAPlay = session.takePlay(duration: 60)
+        #expect(!isAPlay, "an hour asleep doesn't award a play")
+        session.update(audible: true, clock: 2.6, now: start.addingTimeInterval(3602.5))
+        #expect(abs((session.record(.stopped, at: 0)?.seconds ?? 0) - 2.6) < 0.001)
+    }
+
+    @Test func aClockThatCountedThroughASleepIsCapped() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        var session = ListenSession(Track(id: 1), now: start)
+        session.update(audible: true, clock: 3, now: start.addingTimeInterval(3))
+        session.update(audible: true, clock: 3603, now: start.addingTimeInterval(3603))
+        let seconds = session.record(.stopped, at: 0)?.seconds ?? 0
+        #expect(abs(seconds - (3 + ListenSession.longestUpdate)) < 0.001)
+    }
+
+    @Test func aStalledOutputIsntListening() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        var session = ListenSession(Track(id: 1), now: start)
+        session.update(audible: true, clock: 1, now: start.addingTimeInterval(1))
+        // The device stops: updates go on with the clock standing still, or gone.
+        session.update(audible: true, clock: 1, now: start.addingTimeInterval(1.5))
+        session.update(audible: true, clock: nil, now: start.addingTimeInterval(2))
+        #expect(abs((session.record(.stopped, at: 0)?.seconds ?? 0) - 1) < 0.001)
+        // It comes back with the clock leapt ahead by the stall: only the half second since counts.
+        session.update(audible: true, clock: 1.5, now: start.addingTimeInterval(2.5))
+        session.update(audible: true, clock: 30, now: start.addingTimeInterval(3))
+        #expect(abs((session.record(.stopped, at: 0)?.seconds ?? 0) - 2) < 0.001)
+    }
+
+    @Test func aRestartedClockCountsFromItsNewStart() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        var session = ListenSession(Track(id: 1), now: start)
+        session.update(audible: true, clock: 5, now: start.addingTimeInterval(5))
+        session.update(audible: true, clock: 0.25, now: start.addingTimeInterval(5.5))
+        #expect(abs((session.record(.stopped, at: 0)?.seconds ?? 0) - 5.25) < 0.001)
+    }
+
+    @Test func pausedTimeIsntListeningWhateverTheClockDoes() {
+        let start = Date(timeIntervalSinceReferenceDate: 0)
+        var session = ListenSession(Track(id: 1), now: start)
+        session.update(audible: true, clock: 2, now: start.addingTimeInterval(2))
+        session.update(audible: false, clock: 2.5, now: start.addingTimeInterval(4))
+        session.update(audible: true, clock: 3, now: start.addingTimeInterval(4.5))
+        #expect(abs((session.record(.stopped, at: 0)?.seconds ?? 0) - 2.5) < 0.001)
+    }
+
+    /// What a stalled device does to the real engine, as near as a test can make it: audio stops
+    /// coming while everything else carries on.
+    @Test func anEngineThatStallsBooksNoListeningTime() async throws {
+        let player = makePlayer()
+        var listens: [ListenRecord] = []
+        player.onListenEnded = { listens.append($1) }
+        let track = try await joining(34, seconds: 8)
+        let start = Date()
+        player.play([track], startingAt: 0)
+        #expect(await waitUntil { player.isPlaying && player.currentTime > 0.5 })
+        let engine = try #require(player.equalizer.unit.engine)
+        engine.pause()
+        let stalled = Date()
+        try? await Task.sleep(for: .seconds(1.5))
+        let stall = Date().timeIntervalSince(stalled)
+        try engine.start()
+        try? await Task.sleep(for: .seconds(1))
+        player.stop()
+        let played = Date().timeIntervalSince(start) - stall
+        let seconds = listens.first?.seconds ?? 0
+        #expect(seconds > 1)
+        // At most the update that sees the output come back can take in a tick's worth of the stall.
+        #expect(seconds <= played + 0.5, "\(seconds)s counted of \(played)s played; the \(stall)s stall shouldn't be")
+    }
+
+    @Test func aPauseStillCountsWhatWasHeardJustBefore() async throws {
+        let player = makePlayer()
+        var listens: [ListenRecord] = []
+        player.onListenEnded = { listens.append($1) }
+        player.play([try Self.tone(35, seconds: 4, in: folder)], startingAt: 0)
+        #expect(await waitUntil { player.currentTime > 1.3 })
+        player.togglePlayPause()
+        let position = player.currentTime
+        player.stop()
+        #expect(abs((listens.first?.seconds ?? 0) - position) < 0.15, "\(listens) by \(position)")
     }
 
     // MARK: The network share
