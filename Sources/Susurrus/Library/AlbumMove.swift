@@ -11,6 +11,26 @@ struct AlbumMove: Codable, Equatable, Sendable {
     var title: String
     /// New file names ("03 Title.flac") by track ID; a track without one keeps its name.
     var names: [Int64: String]
+    /// Saved once the album is copied and checked, before anything else changes, so a move cut
+    /// short from there on (a crash, the power, a share dropping) is finished instead of lost.
+    var commit: Commit?
+
+    struct Commit: Codable, Equatable, Sendable {
+        /// The finished copy, in its hidden folder.
+        var staging: String
+        /// The folder it becomes.
+        var destination: String
+        /// Where the tracks were, by track ID.
+        var oldPaths: [Int64: String]
+        /// Each track's file name in the new folder, by track ID.
+        var files: [Int64: String]
+
+        /// Where the tracks go.
+        var newPaths: [Int64: String] {
+            let folder = URL(fileURLWithPath: destination, isDirectory: true)
+            return files.mapValues { folder.appendingPathComponent($0).path }
+        }
+    }
 }
 
 /// Where a download goes in the library folder going by its own tags, for Move to Library when
@@ -195,13 +215,42 @@ enum AlbumMoveFiles {
 
     /// Puts the copied album in its folder, making the artist folder if it's new.
     static func putInPlace(_ copy: Copy) throws {
+        try putInPlace(staging: copy.staging, destination: copy.destination)
+    }
+
+    static func putInPlace(staging: URL, destination: URL) throws {
         let fileManager = FileManager.default
-        try fileManager.createDirectory(at: copy.destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fileManager.moveItem(at: copy.staging, to: copy.destination)
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fileManager.moveItem(at: staging, to: destination)
     }
 
     static func discard(_ copy: Copy) {
         try? FileManager.default.removeItem(at: copy.staging)
+    }
+
+    /// How far a committed move got, by what's in the library folder.
+    enum Progress {
+        /// The finished copy is still in its hidden folder.
+        case staged([(id: Int64, stamp: FileStamp)])
+        /// It's in its folder.
+        case inPlace([(id: Int64, stamp: FileStamp)])
+        /// The copy isn't there any more, or not all of it.
+        case lost
+    }
+
+    /// Looks at what a move that was cut short left, with each file's date and size.
+    static func progress(of commit: AlbumMove.Commit) -> Progress {
+        func stamps(in folder: URL) -> [(id: Int64, stamp: FileStamp)]? {
+            var found: [(id: Int64, stamp: FileStamp)] = []
+            for (id, name) in commit.files {
+                guard let stamp = try? stamp(of: folder.appendingPathComponent(name)) else { return nil }
+                found.append((id, stamp))
+            }
+            return found
+        }
+        let staging = URL(fileURLWithPath: commit.staging, isDirectory: true)
+        if isFolder(staging) { return stamps(in: staging).map(Progress.staged) ?? .lost }
+        return stamps(in: URL(fileURLWithPath: commit.destination, isDirectory: true)).map(Progress.inPlace) ?? .lost
     }
 
     /// Copies left in `root` by a move that was cut short (susurrus quit, the share dropped).

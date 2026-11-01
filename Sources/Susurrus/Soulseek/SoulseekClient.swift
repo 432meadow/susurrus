@@ -41,11 +41,16 @@ struct SlskDownloadRequest: Sendable {
 }
 
 enum SlskDownloadState: Equatable, Sendable {
+    /// No session to ask for it in: it's asked for once there is one.
+    case waitingForConnection
     case connecting
     case requested
     case queued(place: UInt32?)
     case transferring(received: UInt64, total: UInt64)
     case finished(URL)
+    /// This try ended, but another may work: the peer couldn't be reached, the transfer broke off.
+    case interrupted(String)
+    /// It won't work by asking again: the uploader refused it, or sent something other than it said.
     case failed(String)
     case cancelled
 }
@@ -109,17 +114,32 @@ actor SoulseekClient {
         var statusCheck: TimeInterval = 15
     }
 
-    /// Background tasks have budgets by kind, so a flood of incoming connections can't starve
-    /// transfers or the distributed parent.
-    private enum TaskKind {
-        case peer, transfer, parent
+    /// How many background tasks of each kind run at once, so a flood of strangers' connections
+    /// can't starve what we asked for. Tests shrink them.
+    struct Limits: Sendable {
+        /// Connections peers open to us, mostly bringing search results.
+        var peers = 96
+        /// Connections we open because we need something from that user: a download, a browse.
+        var channels = 64
+        /// Answers to other users' searches: the first thing to go when there's too much to do.
+        var answers = 32
+        /// File transfers, both ways.
+        var transfers = 40
+        /// A peer connection this quiet makes way for a new one once `peers` is spent.
+        var quietBeforeMakingWay: TimeInterval = 1
+    }
 
-        var budget: Int {
-            switch self {
-            case .peer: 96
-            case .transfer: 40
-            case .parent: 1
-            }
+    private enum TaskKind {
+        case peer, channel, answer, transfer, parent
+    }
+
+    private func budget(of kind: TaskKind) -> Int {
+        switch kind {
+        case .peer: limits.peers
+        case .channel: limits.channels
+        case .answer: limits.answers
+        case .transfer: limits.transfers
+        case .parent: 1
         }
     }
 
@@ -127,6 +147,7 @@ actor SoulseekClient {
     private let password: String
     private let serverAddress: (host: String, port: UInt16)
     private let timeouts: Timeouts
+    private let limits: Limits
     private let onEvent: @Sendable (SlskEvent) -> Void
 
     private var server: TCPConnection?
@@ -192,6 +213,11 @@ actor SoulseekClient {
     /// Message connections per user (ours and theirs) still being read; when the last one
     /// closes, requests still waiting on that user fail.
     private var messageConnections: [String: Int] = [:]
+    /// Connections peers opened that are being read, and when each last spoke, so the quietest
+    /// can make way once the budget is spent.
+    private var quietablePeers: [ObjectIdentifier: (stream: any SlskStream, user: String, lastHeard: ContinuousClock.Instant)] = [:]
+    /// Part files being written, so a stale try still winding down can't interleave with a new one.
+    private var partFilesInUse: Set<URL> = []
 
     // MARK: Sharing state
 
@@ -226,12 +252,14 @@ actor SoulseekClient {
         password: String,
         server: (host: String, port: UInt16) = SoulseekClient.defaultServer,
         timeouts: Timeouts = Timeouts(),
+        limits: Limits = Limits(),
         onEvent: @escaping @Sendable (SlskEvent) -> Void
     ) {
         self.username = username
         self.password = password
         serverAddress = server
         self.timeouts = timeouts
+        self.limits = limits
         self.onEvent = onEvent
     }
 
@@ -242,6 +270,7 @@ actor SoulseekClient {
     func connect() async throws {
         guard server == nil else { return }
 
+        _ = SlskFileLimit.raised
         let listenPort = startListener()
         let server = TCPConnection(host: serverAddress.host, port: serverAddress.port, keepAlive: true)
         self.server = server
@@ -316,10 +345,11 @@ actor SoulseekClient {
         activeUploadCount = 0
         hasParent = false
         adoptingParent = false
-        // Files being moved into place still finish (and report it).
+        // They're asked for again next session. Files being moved into place still finish (and
+        // report it).
         for (id, download) in downloads where !download.isCompleting {
             download.fileStream?.cancel()
-            onEvent(.downloadState(id: id, state: .failed(reason ?? "Disconnected")))
+            onEvent(.downloadState(id: id, state: .waitingForConnection))
         }
         downloads = [:]
         for channel in peerChannels.values { channel.cancel() }
@@ -327,6 +357,7 @@ actor SoulseekClient {
         for task in channelTasks.values { task.cancel() }
         channelTasks = [:]
         messageConnections = [:]
+        quietablePeers = [:]
         for task in sessionTasks { task.cancel() }
         sessionTasks = []
         for entry in backgroundTasks.values { entry.task.cancel() }
@@ -488,8 +519,8 @@ actor SoulseekClient {
                   averageSpeed: 0,
                   queueLength: UInt32(uploadQueue.count))
         else { return }
-        spawn(.peer) {
-            guard let channel = await self.channel(to: searcher) else { return }
+        spawn(.answer) {
+            guard let channel = await self.channel(to: searcher, kind: .peer) else { return }
             try? await channel.send(message)
         }
     }
@@ -531,13 +562,14 @@ actor SoulseekClient {
             }
         case .connectToPeer:
             guard let request = try? SlskConnectToPeer(parsing: payload) else { return }
-            let kind: TaskKind
+            let started: Bool
             switch request.connectionType {
-            case "P": kind = .peer
-            case "F": kind = .transfer
+            case "P": started = spawnPeer { await self.runOutgoingPeer(request) }
+            case "F": started = spawn(.transfer) { await self.runOutgoingPeer(request) }
             default: return  // "D": we take no distributed children
             }
-            guard spawn(kind, { await self.runOutgoingPeer(request) }) else {
+            guard started else {
+                noteTurnedAway(type: request.connectionType)
                 try? await server?.send(SlskServerMessage.cantConnectToPeer(token: request.token, username: request.username))
                 return
             }
@@ -672,8 +704,8 @@ actor SoulseekClient {
     /// Runs `body` as a background task of `kind`; false (and nothing runs) when that kind's
     /// budget is spent.
     @discardableResult
-    private func spawn(_ kind: TaskKind, _ body: @escaping @Sendable () async -> Void) -> Bool {
-        guard runningTasks[kind, default: 0] < kind.budget else { return false }
+    private func spawn(_ kind: TaskKind, overBudget: Bool = false, _ body: @escaping @Sendable () async -> Void) -> Bool {
+        guard overBudget || runningTasks[kind, default: 0] < budget(of: kind) else { return false }
         runningTasks[kind, default: 0] += 1
         let id = UUID()
         backgroundTasks[id] = (kind, Task {
@@ -681,6 +713,34 @@ actor SoulseekClient {
             self.taskFinished(id)
         })
         return true
+    }
+
+    /// Runs `body` as a peer task. With the budget spent the quietest connection that nothing is
+    /// waiting on makes way: peers usually say what they came to say at once, so a new one is
+    /// likelier to matter than one that has gone quiet.
+    private func spawnPeer(_ body: @escaping @Sendable () async -> Void) -> Bool {
+        if spawn(.peer, body) { return true }
+        guard makeWayForPeer() else { return false }
+        return spawn(.peer, overBudget: true, body)
+    }
+
+    private func makeWayForPeer() -> Bool {
+        let cutoff = ContinuousClock.now - .seconds(limits.quietBeforeMakingWay)
+        let needed = Set(downloads.values.map(\.request.username) + uploadQueue.map(\.username))
+        let quietest = quietablePeers
+            .filter { $0.value.lastHeard <= cutoff && !needed.contains($0.value.user)
+                && !fileLists.isWaiting(for: $0.value.user) && !userInfos.isWaiting(for: $0.value.user) }
+            .min { $0.value.lastHeard < $1.value.lastHeard }
+        guard let quietest else { return false }
+        quietablePeers[quietest.key] = nil
+        quietest.value.stream.cancel()
+        return true
+    }
+
+    /// A connection had to be refused: too many at once. The log says so, since what it was
+    /// bringing is lost (a search result), or comes later (a transfer the download asks for again).
+    private func noteTurnedAway(type: String) {
+        EventLog.shared.log("Soulseek: too many connections at once; turned away a \(type == "F" ? "file transfer" : "peer")", level: .info)
     }
 
     private func taskFinished(_ id: UUID) {
@@ -706,7 +766,12 @@ actor SoulseekClient {
 
     private func acceptIncomingPeer(_ connection: SocketConnection) {
         // A connection accepted just before the session ended has nobody to talk to.
-        guard listener != nil, spawn(.peer, { await self.runIncomingPeer(connection) }) else { return connection.cancel() }
+        guard listener != nil else { return connection.cancel() }
+        guard spawnPeer({ await self.runIncomingPeer(connection) }) else {
+            noteTurnedAway(type: "P")
+            connection.cancel()
+            return
+        }
     }
 
     /// A peer connected to our listener: expect a greeting (PeerInit or PierceFireWall) within
@@ -721,13 +786,15 @@ actor SoulseekClient {
         case .peerInit(let user, "P"):
             if peerChannels[user] == nil { peerChannels[user] = connection }
             defer { channelClosed(user, connection: connection) }
-            await runPeerMessageLoop(connection, frames: &frames, username: user)
+            await runPeerMessageLoop(connection, frames: &frames, username: user, canMakeWay: true)
         case .peerInit(let user, "F"):
             let buffered = frames.drainRemaining()
-            ownsConnection = !spawn(.transfer) {
+            let started = spawn(.transfer) {
                 await self.runFileConnection(connection, buffered: buffered, from: user)
                 connection.cancel()
             }
+            ownsConnection = !started
+            if !started { await turnAwayFileConnection(connection, buffered: buffered, from: user) }
         case .pierceFirewall(let token):
             guard let request = pierceRequests[token], request.expires > .now else { return }
             if request.type == "F" {
@@ -743,10 +810,25 @@ actor SoulseekClient {
                 peerChannels[request.user] = connection
             }
             defer { channelClosed(request.user, connection: connection) }
-            await runPeerMessageLoop(connection, frames: &frames, username: request.user)
+            await runPeerMessageLoop(connection, frames: &frames, username: request.user, canMakeWay: true)
         default:
             return  // "D" connections from others: we accept no distributed children.
         }
+    }
+
+    /// No transfer can start right now. If this one is for a download, that download has to ask
+    /// again later, or it would wait for a connection that has come and gone.
+    private func turnAwayFileConnection(_ connection: SocketConnection, buffered: Data, from user: String) async {
+        noteTurnedAway(type: "F")
+        var raw = buffered
+        while raw.count < 4 {
+            guard let chunk = try? await connection.receive(timeout: timeouts.handshake) else { return }
+            raw.append(chunk)
+        }
+        var reader = SlskReader(raw)
+        guard let token = try? reader.u32(),
+              let match = downloads.first(where: { $0.value.transferToken == token && $0.value.request.username == user }) else { return }
+        interruptDownload(match.key, "Too many transfers at once")
     }
 
     /// The server relayed a connection request: dial the peer and pierce their firewall.
@@ -768,19 +850,26 @@ actor SoulseekClient {
             if peerChannels[request.username] == nil { peerChannels[request.username] = connection }
             defer { channelClosed(request.username, connection: connection) }
             var frames = SlskFrameBuffer()
-            await runPeerMessageLoop(connection, frames: &frames, username: request.username)
+            await runPeerMessageLoop(connection, frames: &frames, username: request.username, canMakeWay: true)
         }
     }
 
-    /// Reads and handles peer messages until the connection closes or goes quiet.
-    private func runPeerMessageLoop(_ connection: any SlskStream, frames: inout SlskFrameBuffer, username: String) async {
+    /// Reads and handles peer messages until the connection closes or goes quiet. `canMakeWay`:
+    /// it counts against the peers budget, so it can be closed for a new one once it's quiet.
+    private func runPeerMessageLoop(_ connection: any SlskStream, frames: inout SlskFrameBuffer, username: String, canMakeWay: Bool) async {
         messageConnections[username, default: 0] += 1
-        defer { messageConnectionEnded(username) }
+        let key = ObjectIdentifier(connection)
+        if canMakeWay { quietablePeers[key] = (connection, username, .now) }
+        defer {
+            quietablePeers[key] = nil
+            messageConnectionEnded(username)
+        }
         frames.largeFrameCode = SlskPeerCode.sharedFileListResponse.rawValue
         while !Task.isCancelled {
             // Someone we asked for their share list may take a while to start sending it.
             let timeout = fileLists.isWaiting(for: username) ? timeouts.browse : timeouts.peerIdle
             guard let frame = try? await nextFrame(&frames, on: connection, timeout: timeout) else { return }
+            quietablePeers[key]?.lastHeard = .now
             await handlePeerFrame(frame, from: username, on: connection)
         }
     }
@@ -807,7 +896,7 @@ actor SoulseekClient {
         case .uploadFailed:
             if let failed = try? SlskUploadFailed(parsing: payload),
                let id = findDownload(path: failed.path, username: username) {
-                failDownload(id, "The uploader reported a failure")
+                interruptDownload(id, "The uploader reported a failure")
             }
         case .placeInQueueResponse:
             if let place = try? SlskPlaceInQueueResponse(parsing: payload),
@@ -882,51 +971,80 @@ actor SoulseekClient {
     /// decides when the transfer actually starts (it may sit in their upload queue for a while).
     func download(_ request: SlskDownloadRequest) async {
         guard isLoggedIn else {
-            onEvent(.downloadState(id: request.id, state: .failed("Not connected")))
+            onEvent(.downloadState(id: request.id, state: .waitingForConnection))
             return
         }
         guard downloads[request.id] == nil, cancelledDownloadIDs.remove(request.id) == nil else { return }
-        // A retry replaces any stale entry for the same file, so a late TransferRequest
-        // can't be matched to a download the UI no longer shows.
-        downloads = downloads.filter {
-            $0.value.isCompleting || $0.value.request.username != request.username
-                || $0.value.request.remotePath != request.remotePath
+        // A retry replaces any stale entry for the same file, so a late TransferRequest can't be
+        // matched to a download the UI no longer shows, and closes its transfer, so the two
+        // don't write into one part file.
+        for (id, stale) in downloads where !stale.isCompleting
+            && stale.request.username == request.username && stale.request.remotePath == request.remotePath {
+            stale.fileStream?.cancel()
+            downloads[id] = nil
         }
         downloads[request.id] = ActiveDownload(request: request, expectedSize: request.size)
         onEvent(.downloadState(id: request.id, state: .connecting))
 
         guard let channel = await channel(to: request.username) else {
-            failDownload(request.id, "Can't reach \(request.username)")
+            interruptDownload(request.id, "Can't reach \(request.username)")
             return
         }
         guard downloads[request.id] != nil else { return }  // disconnected or cancelled meanwhile
         do {
             try await channel.send(SlskPeerMessage.queueUpload(path: request.remotePath))
-            onEvent(.downloadState(id: request.id, state: .requested))
+            // A transfer can already be under way when this send comes back.
+            if downloads[request.id]?.fileStream == nil {
+                onEvent(.downloadState(id: request.id, state: .requested))
+            }
         } catch {
-            failDownload(request.id, "Couldn't request the file")
+            interruptDownload(request.id, "Couldn't request the file")
+        }
+    }
+
+    /// Asks `user` again for files it hasn't started sending. They may have restarted and lost
+    /// their queue, or an offered transfer may never have arrived. Uploaders take no notice of a
+    /// file they already have queued. Someone who can't be reached now keeps their place: the
+    /// next round asks again, and going offline and coming back asks at once.
+    func requeue(_ ids: [UUID], from user: String) async {
+        guard isLoggedIn, let channel = await channel(to: user) else { return }
+        for id in ids {
+            guard let download = downloads[id], download.fileStream == nil, !download.isCompleting else { continue }
+            try? await channel.send(SlskPeerMessage.queueUpload(path: download.request.remotePath))
         }
     }
 
     /// Forgets a download and closes its transfer if one is running. The peer gets no message
     /// for a queued file (the protocol has none); when it later offers the transfer,
-    /// `handleTransferRequest` declines it. The download's own partial file is deleted.
-    func cancelDownload(_ id: UUID) {
-        guard let download = downloads.removeValue(forKey: id) else {
+    /// `handleTransferRequest` declines it. The download's own partial file is deleted. A file
+    /// already being moved into place finishes.
+    func cancelDownload(_ id: UUID, partURL: URL) {
+        guard let download = downloads[id] else {
             cancelledDownloadIDs.insert(id)
+            SlskTransferFiles.remove(partURL)
             return
         }
         guard !download.isCompleting else { return }
+        downloads[id] = nil
         download.fileStream?.cancel()
-        SlskTransferFiles.remove(download.request.partURL)
+        SlskTransferFiles.remove(partURL)
     }
 
-    /// Ends a download that can't go on; its partial file stays for a retry.
+    /// Ends a download that asking again won't help; its partial file stays for a retry by hand.
     private func failDownload(_ id: UUID, _ reason: String) {
+        endDownload(id, as: .failed(reason))
+    }
+
+    /// Ends this try at a download; its partial file stays, for the next to resume.
+    private func interruptDownload(_ id: UUID, _ reason: String) {
+        endDownload(id, as: .interrupted(reason))
+    }
+
+    private func endDownload(_ id: UUID, as state: SlskDownloadState) {
         guard let download = downloads[id], !download.isCompleting else { return }
         downloads[id] = nil
         download.fileStream?.cancel()
-        onEvent(.downloadState(id: id, state: .failed(reason)))
+        onEvent(.downloadState(id: id, state: state))
     }
 
     /// The live download `username` means by `path` — never another user's.
@@ -949,13 +1067,22 @@ actor SoulseekClient {
         }
         downloads[id]?.transferToken = request.token
         if request.size > 0 { downloads[id]?.expectedSize = request.size }
-        try? await connection.send(SlskPeerMessage.transferResponse(token: request.token, allowed: true))
+        do {
+            try await connection.send(SlskPeerMessage.transferResponse(token: request.token, allowed: true))
+        } catch {
+            interruptDownload(id, "Couldn't answer \(username)")
+        }
     }
+
+    /// Refusals that can pass: the uploader's limits for now, or it's going away for a moment.
+    private static let passingRefusals: Set<String> = ["too many files", "too many megabytes", "pending shutdown", "file read error"]
 
     private func handleUploadDenied(_ denied: SlskUploadDenied, from username: String) {
         guard let id = findDownload(path: denied.path, username: username) else { return }
         if denied.reason == "Queued" {
             onEvent(.downloadState(id: id, state: .queued(place: nil)))
+        } else if Self.passingRefusals.contains(denied.reason.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: ". "))) {
+            interruptDownload(id, denied.reason)
         } else {
             failDownload(id, denied.reason)
         }
@@ -967,7 +1094,7 @@ actor SoulseekClient {
     private func runFileConnection(_ connection: any SlskStream, buffered: Data, from user: String) async {
         var raw = buffered
         while raw.count < 4 {
-            guard let chunk = try? await connection.receive(timeout: timeouts.peerIdle) else { return }
+            guard let chunk = try? await connection.receive(timeout: timeouts.handshake) else { return }
             raw.append(chunk)
         }
         var reader = SlskReader(raw)
@@ -982,15 +1109,24 @@ actor SoulseekClient {
 
         let expected = match.value.expectedSize
         let partURL = match.value.request.partURL
+        // A try that was replaced stops as soon as its connection closes; wait for that, so the
+        // two never write into the part file together.
+        while partFilesInUse.contains(partURL) {
+            try? await Task.sleep(for: .milliseconds(20))
+            guard downloads[id] != nil, !Task.isCancelled else { return }
+        }
+        partFilesInUse.insert(partURL)
+        defer { partFilesInUse.remove(partURL) }
         let opened: (file: SlskPartFile, offset: UInt64)
         do {
             opened = try await SlskPartFile.open(partURL, expectedSize: expected)
         } catch {
-            failDownload(id, "Couldn't write the file: \(error.localizedDescription)")
+            interruptDownload(id, "Couldn't write the file: \(error.localizedDescription)")
             return
         }
         let file = opened.file
         var received = opened.offset
+        var sentTooMuch = false
         do {
             guard downloads[id] != nil else {
                 // Cancelled while the file was opened.
@@ -1012,8 +1148,10 @@ actor SoulseekClient {
                     guard let chunk = try await connection.receive(timeout: timeouts.transferIdle) else { break }
                     pending = chunk
                 }
-                // Anything past the expected size isn't part of the file.
-                let piece = pending.prefix(Int(min(UInt64(pending.count), expected - received)))
+                // More than it said means it said wrong: the file has changed since it was listed.
+                let remaining = expected - received
+                if UInt64(pending.count) > remaining { sentTooMuch = true }
+                let piece = pending.prefix(Int(min(UInt64(pending.count), remaining)))
                 pending = Data()
                 try await file.write(piece)
                 received += UInt64(piece.count)
@@ -1023,17 +1161,25 @@ actor SoulseekClient {
                     onEvent(.downloadState(id: id, state: .transferring(received: received, total: expected)))
                 }
             }
+            // The same if the rest comes just after the last byte it said there was.
+            if !sentTooMuch, received >= expected, let extra = try? await connection.receive(timeout: 0.2), !extra.isEmpty {
+                sentTooMuch = true
+            }
             await file.close()
         } catch {
             await file.close()
-            failDownload(id, "Transfer failed: \(error.localizedDescription)")
+            interruptDownload(id, "Transfer failed: \(error.localizedDescription)")
             return
         }
         guard downloads[id] != nil else { return }  // cancelled
-        if received >= expected {
+        if sentTooMuch {
+            // Cut off at that size it's a damaged file, and a retry would take these bytes as complete.
+            SlskTransferFiles.remove(partURL)
+            failDownload(id, "\(user) sent more than the file's size: it may have changed since it was listed")
+        } else if received >= expected {
             await completeDownload(id)
         } else {
-            failDownload(id, "Transfer interrupted")
+            interruptDownload(id, "Transfer interrupted")
         }
     }
 
@@ -1044,10 +1190,12 @@ actor SoulseekClient {
         downloads[id]?.fileStream = nil
         let request = download.request
         do {
-            let url = try await SlskTransferFiles.moveIntoPlace(request.partURL, to: request.destinationURL)
+            let url = try await SlskTransferFiles.moveIntoPlace(request.partURL, to: request.destinationURL, expectedSize: download.expectedSize)
             onEvent(.downloadState(id: id, state: .finished(url)))
+        } catch let error as SlskError {
+            onEvent(.downloadState(id: id, state: .interrupted(error.message)))
         } catch {
-            onEvent(.downloadState(id: id, state: .failed("Couldn't move the finished file")))
+            onEvent(.downloadState(id: id, state: .interrupted("Couldn't move the finished file")))
         }
         downloads[id] = nil
     }
@@ -1183,28 +1331,29 @@ actor SoulseekClient {
 
     /// An open message connection to `user`, establishing one if needed. Concurrent requests
     /// (several files of one album) share the attempt.
-    private func channel(to user: String) async -> (any SlskStream)? {
+    private func channel(to user: String, kind: TaskKind = .channel) async -> (any SlskStream)? {
         if let existing = peerChannels[user] { return existing }
         if let inFlight = channelTasks[user] { return await inFlight.value }
-        let task = Task { await self.establishChannel(to: user) }
+        let task = Task { await self.establishChannel(to: user, kind: kind) }
         channelTasks[user] = task
         let result = await task.value
         if channelTasks[user] == task { channelTasks[user] = nil }
         return result
     }
 
-    private func establishChannel(to user: String) async -> (any SlskStream)? {
+    private func establishChannel(to user: String, kind: TaskKind) async -> (any SlskStream)? {
         guard let connection = await openConnection(to: user, type: "P") else { return nil }
         let stream = connection.stream
         if !connection.pierced {
             // We dialed it, so nothing reads it yet. (A pierced one is read by its accept task.)
-            let reading = spawn(.peer) {
+            let reading = spawn(kind) {
                 var frames = SlskFrameBuffer()
-                await self.runPeerMessageLoop(stream, frames: &frames, username: user)
+                await self.runPeerMessageLoop(stream, frames: &frames, username: user, canMakeWay: kind == .peer)
                 stream.cancel()
                 await self.channelClosed(user, connection: stream)
             }
             guard reading else {
+                if kind == .channel { noteTurnedAway(type: "P") }
                 stream.cancel()
                 return nil
             }

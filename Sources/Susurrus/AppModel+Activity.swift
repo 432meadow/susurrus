@@ -32,6 +32,11 @@ extension AppModel {
         if tagWriter.isRunning {
             result.append(Activity(id: "tags", title: "Writing tags", done: tagWriter.done, total: tagWriter.total))
         }
+        if !tagWriter.waiting.isEmpty {
+            let count = tagWriter.waiting.count
+            result.append(Activity(id: "tags-waiting", title: "\(count.formatted()) \(count == 1 ? "file waits" : "files wait") to have tags written",
+                                   stop: { [weak self] in self?.tagWriter.forgetWaiting() }))
+        }
         if bpmAnalyzer.isRunning {
             result.append(Activity(id: "bpm", title: "Detecting BPM", done: bpmAnalyzer.done, total: bpmAnalyzer.total,
                                    stop: { [weak self] in self?.bpmAnalyzer.cancel() }))

@@ -284,11 +284,22 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   Files land in Settings ▸ Soulseek's download folder (default `~/Music/Soulseek`), inside their
   remote folder name so albums stay together (a "CD1"/"Disc 2" folder keeps its album folder:
   `Album/CD1/`). Partial files collect in the hidden `.incomplete` folder, one per user and file,
-  resume from where they stopped (Retry in the row's context menu) and restart if one is bigger
-  than the file; finished files never replace an existing one and are quarantined like a
+  resume from where they stopped and restart if one is bigger than the file or the uploader's
+  file has changed size; finished files never replace an existing one and are quarantined like a
   browser's downloads, and finished folders are **imported into the library automatically**
   (and, once matched, moved to the library folder; see below). Cancel All and Cancel Folder ask
   first.
+- **Downloads keep going** (`Soulseek/Downloads.json`, next to the library). Unfinished ones and
+  folders not yet imported are saved, so they carry on after a lost connection and at the next
+  launch, which connects for them unless you disconnected before quitting. A try that ends without
+  the file (the peer can't be reached, the transfer breaks off, the uploader's queue is full) is
+  repeated after 30 s, then less and less often for about 3 hours, and only then fails; getting
+  further doesn't count against it. An uploader who is offline is waited for without using up
+  tries, and asked again as soon as they're back. Uploaders are also asked again every 15 minutes
+  for files they haven't started sending, in case they restarted. Refusals for good ("File not
+  shared.") fail at once, with Retry in the context menu. An uploader sending more than the size
+  it announced fails the download rather than leaving it cut off, and so does a finished file of
+  the wrong size on disk.
 - The protocol (message layouts, zlib-wrapped search results, the direct + server-relayed peer
   connection dance, and the QueueUpload → TransferRequest → raw-byte `F` connection transfer
   flow) follows Nicotine+ 3.3.10's `doc/SLSKPROTOCOL.md`, implemented from scratch in
@@ -296,7 +307,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   listener uses BSD sockets because `NWListener` fails (EINVAL) on Macs with certain network
   filters; without a reachable port everything still works through server-relayed connections.
   A peer is dialed and asked to connect back at the same time, and whichever arrives first is
-  used, so firewalled peers are reached in seconds.
+  used, so firewalled peers are reached in seconds. Connections have budgets by purpose, so
+  strangers can't crowd out what you asked for: once incoming ones reach theirs, the quietest
+  makes way for a new one, unless a transfer or browse is waiting on that user.
 - **Sharing**: pick a shared folder in Settings ▸ Soulseek. The share is built from the library's
   tracks in that folder (with their bitrate, length and bit depth), so it's up at once without
   reading the share; files the library doesn't have are found by a walk of the folder in the
@@ -359,7 +372,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
     moved one at a time, shown in the activity button (with Stop). While the library folder isn't
     there (its share isn't mounted), they wait, saved in `Album moves.json` next to the library,
     and move once it mounts or at the next launch. A move that fails for another reason leaves the
-    album in the download folder and says why.
+    album in the download folder and says why. One cut short (a crash, the power) is picked up at
+    the next launch by what it left: the finished copy is saved in that file before the library
+    follows it, and the download is only deleted once the album is in its folder.
   - **Sort into Artist/Album (Year) here**: the same file names, inside the download folder.
   - **Leave as they are.** (Before there was a choice, "Move them into Artist/Album (Year)
     folders" decided between these two, and it still does for anyone who switched it.)
@@ -391,6 +406,12 @@ time). With it on, Get Info edits and ratings are queued and written into the fi
 background, one file at a time, with progress in Settings and the window subtitle. Play counts
 stay in susurrus's database (rewriting a file after every play isn't worth it).
 
+A write that fails for a reason that can pass isn't lost. If the share dropped, that file and
+everything else queued for that share wait, saved, and go in when a volume mounts, every 5 minutes,
+at the next launch, or on Try Now in Settings; a file another app was changing is tried up to three
+times. A new edit to a waiting file goes in with what it owes. Writes that can't work (a WAV, say,
+or a file that's gone from a share that's there) are listed in Settings with Try Again.
+
 | Format | Tags | Rating | Cover |
 | --- | --- | --- | --- |
 | MP3 | ID3v2.2 / v2.3 / v2.4 (keeps the file's version; untagged files get v2.3) | `POPM`, MusicBee values (½★ = 13 … 4½★ = 242, 5★ = 255); existing POPM frames keep their email and play counter | `APIC` (`PIC` in v2.2), front cover; other pictures kept |
@@ -409,13 +430,14 @@ When the new MP3/FLAC tags fit in the space the old tag takes up (its padding ab
 change, which is the usual case), only the tag is read and only the byte ranges that changed are
 written back in place, then read back and compared (the old bytes are put back if they differ).
 The audio is never written to. Over a slow network share (~1.3 MB/s) that took writes from about a
-minute per file to a few seconds. In-place writes are capped at 64 KB in all: a bigger change takes
-the temp-copy path, so a connection that drops mid-write can't leave a tag half old and half new.
+minute per file to a few seconds. In-place writes are capped at 64 KB in all, and a bigger change
+takes the temp-copy path, so a connection that drops mid-write is unlikely to leave a tag half old
+and half new; if it does, the write waits for the share and the next try repairs it.
 To keep them small, FLAC comments that grow move into the padding (their old place becomes
 padding), so the cover doesn't move; an ID3 frame that changes size moves to the end of the tag,
 so the first such edit of a field that sits before a large cover goes through the temp copy and
 later edits of it are small. If the original's size or modification date changed
-meanwhile it's skipped. Otherwise permissions, creation date and extended attributes (Finder
+meanwhile it's tried again later. Otherwise permissions, creation date and extended attributes (Finder
 tags) are copied over and the copy is renamed over the original (atomic). The track that's
 playing is written once it stops playing.
 
@@ -471,13 +493,13 @@ volume (SMB, AFP, NFS) can arrive slowly (the share susurrus was developed again
 | `Sources/Susurrus/Reporting/` | Bug reports: event log, diagnostics, redaction, crash report summaries, the GitHub issue link |
 | `Sources/Susurrus/UI/` | Track table (NSTableView), shared track and album menus, sidebar, albums, browser, Up Next, Get Info, smart editor, EQ, mixer, import and export sheets, activity button and notices, Soulseek (+ messages and user info), settings, menu bar |
 | `Sources/ObjCSupport/` | Catches NSExceptions (predicate evaluation, audio graph connections) |
-| `Tests/SusurrusTests/` | 322 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, chains across sample rates and channel counts (heard through a tap), output devices (one that really comes and goes, a stand-in for the system's default), media keys over a live mix, Continue in Mixer's listens, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download, moving by a download's own tags), fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, and saved conversations |
+| `Tests/SusurrusTests/` | 379 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, chains across sample rates and channel counts (heard through a tap), output devices (one that really comes and goes, a stand-in for the system's default), media keys over a live mix, Continue in Mixer's listens, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download, moving by a download's own tags, picking up a move cut short at each step), tag writes that wait for a share or file and are retried, fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, sizes that don't add up, connection budgets, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, the download queue (retries, lost connections, uploaders coming and going, surviving a quit), and saved conversations |
 
 ## Known issues
 
 - ID3v1 tags at the end of MP3s aren't updated. (Tag writes still queued at quit are saved in
-  the database and picked up at the next launch, unless Write tags to files was turned off. They're
-  saved in batches off the main thread, a cover queued for many tracks is kept once in `Queued
+  the database and picked up at the next launch, except those to files outside the download folder
+  when Write tags to files was turned off. They're saved in batches off the main thread, a cover queued for many tracks is kept once in `Queued
   Covers` next to the library, and when the queue empties a database with 64 MB or more unused is
   compacted.)
 - The smart playlist match count can take a few seconds on the full library.

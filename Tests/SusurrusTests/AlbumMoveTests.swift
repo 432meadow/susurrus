@@ -201,6 +201,177 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: album.path))
     }
 
+    // MARK: A move cut short
+
+    /// One album's download, in the library database, plus what the queue saved just before
+    /// susurrus stopped: `AppModel` is then opened on it, as the next launch does.
+    private struct CutShort {
+        let support: URL
+        let album: URL
+        let original: URL
+        let ids: [Int64]
+        let move: AlbumMove
+        let commit: AlbumMove.Commit
+        let copy: AlbumMoveFiles.Copy
+        var libraryURL: URL { support.appendingPathComponent("Library.sqlite") }
+        var movesURL: URL { support.appendingPathComponent("Album moves.json") }
+        var finalPath: String { commit.newPaths[ids[0]]! }
+    }
+
+    private func cutShort() throws -> CutShort {
+        let support = base.appendingPathComponent("Support", isDirectory: true)
+        let store = try LibraryStore(url: support.appendingPathComponent("Library.sqlite"))
+        let album = downloads.appendingPathComponent("Artist - Album")
+        let files = try makeFiles(["a.wav", "cover.jpg"], in: album)
+        let ids = try store.insert([ScannedTrack(path: files[0].path, title: "A")])
+        let names = [ids[0]: "01 A.wav"]
+        let copy = try AlbumMoveFiles.copy([(ids[0], files[0].path, "01 A.wav")], from: album, to: library,
+                                           target: "Artist/Album", isCancelled: { false }, copied: { _ in })
+        let commit = AlbumMove.Commit(staging: copy.staging.path, destination: copy.destination.path,
+                                      oldPaths: [ids[0]: files[0].path], files: names)
+        let move = AlbumMove(folder: album.path, target: "Artist/Album", title: "Artist – Album", names: names, commit: commit)
+        try AlbumMoveFiles.save([move], to: support.appendingPathComponent("Album moves.json"))
+        return CutShort(support: support, album: album, original: files[0], ids: ids, move: move, commit: commit, copy: copy)
+    }
+
+    private func nextLaunch(_ state: CutShort) -> AppModel {
+        UserDefaults.standard.set(downloads.path, forKey: "soulseek.downloadFolder")
+        UserDefaults.standard.set(library.path, forKey: "soulseek.albumFolder")
+        return AppModel(libraryURL: state.libraryURL)
+    }
+
+    private func expectMoved(_ model: AppModel, _ state: CutShort) throws {
+        let track = try #require(model.tracksByID[state.ids[0]])
+        #expect(track.path == state.finalPath, "the same track, at its new place")
+        #expect(try model.store?.fileStamps()[state.finalPath]?.stamp.size == 100, "a rescan takes the copies as they are")
+        #expect(contents(of: URL(fileURLWithPath: state.commit.destination)) == ["01 A.wav", "cover.jpg"])
+        #expect(!FileManager.default.fileExists(atPath: state.album.path), "the download went once the album was in place")
+        #expect(!FileManager.default.fileExists(atPath: state.commit.staging))
+        #expect(model.queuedAlbumMoves.isEmpty && !FileManager.default.fileExists(atPath: state.movesURL.path))
+    }
+
+    @Test func aMoveCutShortAfterTheLibraryFollowedGoesForward() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        // The library was pointed at the copy; the hidden folder hadn't been renamed yet.
+        try LibraryStore(url: state.libraryURL).updatePath(state.finalPath, bookmark: nil, forTrack: state.ids[0])
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        try expectMoved(model, state)
+    }
+
+    @Test func aMoveCutShortAfterTheRenameFinishesTidyingUp() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        try AlbumMoveFiles.putInPlace(state.copy)
+        try LibraryStore(url: state.libraryURL).updatePath(state.finalPath, bookmark: nil, forTrack: state.ids[0])
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        try expectMoved(model, state)
+    }
+
+    @Test func aMoveCutShortBeforeTheLibraryFollowedStartsOver() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        // Its tags may have been edited since: the old copy mustn't go in, and the fresh one has them.
+        try Data(repeating: 9, count: 100).write(to: state.original)
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        #expect(try Data(contentsOf: URL(fileURLWithPath: state.finalPath)) == Data(repeating: 9, count: 100))
+        try expectMoved(model, state)
+    }
+
+    @Test func aMoveWhoseCopyIsGoneGoesBackToTheDownloadAndMovesAgain() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        AlbumMoveFiles.discard(state.copy)
+        try LibraryStore(url: state.libraryURL).updatePath(state.finalPath, bookmark: nil, forTrack: state.ids[0])
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        try expectMoved(model, state)
+    }
+
+    @Test func aMoveWhoseFolderNameWasTakenMeanwhileUsesTheNext() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        try LibraryStore(url: state.libraryURL).updatePath(state.finalPath, bookmark: nil, forTrack: state.ids[0])
+        try makeFiles(["Artist/Album/other.flac"], in: library)
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        let track = try #require(model.tracksByID[state.ids[0]])
+        #expect(track.path == library.appendingPathComponent("Artist/Album (2)/01 A.wav").path)
+        #expect(FileManager.default.fileExists(atPath: track.path))
+        #expect(contents(of: library.appendingPathComponent("Artist/Album")) == ["other.flac"], "never merged into")
+        #expect(!FileManager.default.fileExists(atPath: state.album.path))
+    }
+
+    @Test func aCommittedMoveWaitsForItsShareAndStopDoesntStrandTheLibrary() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        try LibraryStore(url: state.libraryURL).updatePath(state.finalPath, bookmark: nil, forTrack: state.ids[0])
+        // The share is away, so the copy can't be looked at yet.
+        let away = base.appendingPathComponent("Away", isDirectory: true)
+        try FileManager.default.moveItem(at: library, to: away)
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        #expect(model.isWaitingForLibraryFolder && model.queuedAlbumMoves.count == 1)
+        #expect(FileManager.default.fileExists(atPath: state.original.path))
+
+        model.stopMovingAlbums()
+        #expect(model.queuedAlbumMoves.count == 1, "the library follows it, so it has to get there")
+
+        try FileManager.default.moveItem(at: away, to: library)
+        model.moveDownloadedAlbums()  // as a mount does
+        await model.albumMoveTask?.value
+        try expectMoved(model, state)
+    }
+
+    @Test func stoppingDropsACommittedMoveTheLibraryDoesntFollowYet() async throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        let away = base.appendingPathComponent("Away", isDirectory: true)
+        try FileManager.default.moveItem(at: library, to: away)
+        let model = nextLaunch(state)
+        await model.albumMoveTask?.value
+        model.stopMovingAlbums()
+        #expect(model.queuedAlbumMoves.isEmpty)
+        #expect(model.tracksByID[state.ids[0]]?.path == state.original.path)
+    }
+
+    @Test func aMoveThatCantTakeItsPlaceGoesBackToTheDownload() async throws {
+        defer { forgetSettings() }
+        let model = makeModel()
+        let store = try #require(model.store)
+        let album = downloads.appendingPathComponent("Artist - Album")
+        let files = try makeFiles(["a.wav"], in: album)
+        let ids = try store.insert([ScannedTrack(path: files[0].path, title: "A")])
+        try model.reload()
+        try makeFiles(["Artist"], in: library)  // a file where its artist folder has to go
+
+        model.queueAlbumMove(AlbumMove(folder: album.path, target: "Artist/Album", title: "Artist – Album", names: [:]))
+        await model.albumMoveTask?.value
+        #expect(model.tracksByID[ids[0]]?.path == files[0].path, "the library followed it back")
+        #expect(FileManager.default.fileExists(atPath: files[0].path))
+        #expect(model.queuedAlbumMoves.isEmpty)
+        #expect(contents(of: library) == ["Artist"], "no hidden copy left behind")
+        #expect(model.notices.contains { $0.kind == .error })
+    }
+
+    @Test func oldQueueFilesStillRead() throws {
+        let url = base.appendingPathComponent("old.json")
+        try Data(#"[{"folder":"/d/A","target":"A/B","title":"A – B","names":[]}]"#.utf8).write(to: url)
+        #expect(AlbumMoveFiles.load(from: url) == [AlbumMove(folder: "/d/A", target: "A/B", title: "A – B", names: [:])])
+    }
+
+    @Test func aRequeueDoesntReplaceAMovePastItsCopy() throws {
+        defer { forgetSettings() }
+        let state = try cutShort()
+        let model = nextLaunch(state)
+        model.albumMoveTask?.cancel()
+        model.queueAlbumMove(AlbumMove(folder: state.album.path, target: "Other/Place", title: "Other", names: [:]))
+        #expect(model.queuedAlbumMoves.first?.commit == state.commit)
+    }
+
     // MARK: Settings and the tag queue
 
     @Test func theChoiceFromBeforeThereWasOne() {

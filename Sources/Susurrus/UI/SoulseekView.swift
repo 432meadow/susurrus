@@ -444,6 +444,8 @@ private struct DownloadRow: View, Equatable {
         switch download.state {
         case .failed, .cancelled:
             Button("Retry") { soulseek.retry(download.id) }
+        case .interrupted:
+            Button("Try Now") { soulseek.tryNow(download.id) }
         default:
             EmptyView()
         }
@@ -465,10 +467,11 @@ private struct DownloadRow: View, Equatable {
 
     private var icon: (name: String, color: Color) {
         switch download.state {
-        case .connecting, .requested: ("arrow.down.circle.dotted", .secondary)
+        case .waitingForConnection, .connecting, .requested: ("arrow.down.circle.dotted", .secondary)
         case .queued: ("hourglass", .secondary)
         case .transferring: (("arrow.down.circle", Palette.cool))
         case .finished: (("checkmark.circle.fill", Palette.warm))
+        case .interrupted: (("arrow.clockwise.circle", Palette.ochre))
         case .failed: (("exclamationmark.triangle.fill", Palette.ochre))
         case .cancelled: ("xmark.circle", .secondary)
         }
@@ -476,6 +479,7 @@ private struct DownloadRow: View, Equatable {
 
     private var statusText: String {
         switch download.state {
+        case .waitingForConnection: "Carries on once connected"
         case .connecting: "Connecting…"
         case .requested: "Waiting for the uploader…"
         case .queued(let place):
@@ -483,6 +487,9 @@ private struct DownloadRow: View, Equatable {
         case .transferring(let received, let total):
             "\(byteCount(received)) of \(byteCount(total))"
         case .finished: "Done — added to the library"
+        case .interrupted(let reason):
+            download.retryDate.map { "\(reason) — trying again at \($0.formatted(date: .omitted, time: .shortened))" }
+                ?? "\(reason) — carries on when they're back"
         case .failed(let reason): reason
         case .cancelled: "Cancelled"
         }

@@ -15,6 +15,15 @@ struct SoulseekDownload: Identifiable, Equatable {
     /// Where the file lands; updated to the actual URL when the transfer finishes.
     var localURL: URL
     var state: SlskDownloadState = .connecting
+    /// Tries in a row that ended without getting any further, for backing off and giving up.
+    var tries = 0
+    /// The most bytes any try has got to.
+    var furthest: UInt64 = 0
+    /// When an interrupted download is tried again; nil: when its uploader comes back, or the
+    /// next session starts.
+    var retryDate: Date?
+    /// The client that has it, whose reports count for it.
+    var session: Int?
 
     var fileName: String { localURL.lastPathComponent }
     var isActive: Bool {
@@ -26,6 +35,74 @@ struct SoulseekDownload: Identifiable, Equatable {
 
     var isFinished: Bool {
         if case .finished = state { true } else { false }
+    }
+}
+
+/// The downloads still wanted, and the finished folders not yet imported, as saved: they carry on
+/// after a quit. Finished downloads aren't kept: their files are in the library by then.
+struct SoulseekSavedQueue: Codable, Equatable {
+    struct Download: Codable, Equatable {
+        var id: UUID
+        var username: String
+        var remotePath: String
+        var size: UInt64
+        var partPath: String
+        var destinationPath: String
+        /// Why it stopped for good; nil while it's still wanted.
+        var failure: String?
+    }
+
+    var downloads: [Download] = []
+    var imports: [String] = []
+
+    var isEmpty: Bool { downloads.isEmpty && imports.isEmpty }
+}
+
+/// The queue's file, written off the main thread, the latest version only.
+final class SoulseekQueueFile: @unchecked Sendable {
+    let url: URL
+    private let queue = DispatchQueue(label: "susurrus.soulseek.queue-file", qos: .utility)
+    private let lock = NSLock()
+    private var latest: SoulseekSavedQueue?
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func load() -> SoulseekSavedQueue {
+        guard let data = try? Data(contentsOf: url) else { return SoulseekSavedQueue() }
+        return (try? JSONDecoder().decode(SoulseekSavedQueue.self, from: data)) ?? SoulseekSavedQueue()
+    }
+
+    func save(_ saved: SoulseekSavedQueue) {
+        let isFirst = lock.withLock {
+            defer { latest = saved }
+            return latest == nil
+        }
+        if isFirst { queue.async { self.writeLatest() } }
+    }
+
+    /// Waits until everything saved so far is on disk.
+    func finishSaving() {
+        queue.sync { writeLatest() }
+    }
+
+    private func writeLatest() {
+        let saved: SoulseekSavedQueue? = lock.withLock {
+            defer { latest = nil }
+            return latest
+        }
+        guard let saved else { return }
+        do {
+            if saved.isEmpty {
+                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            } else {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(saved).write(to: url, options: .atomic)
+            }
+        } catch {
+            EventLog.shared.log("Couldn't save the Soulseek downloads: \(error.localizedDescription)")
+        }
     }
 }
 
@@ -121,6 +198,16 @@ final class SoulseekModel {
         disconnect()
         connect()
     }
+
+    /// The user went offline on purpose (or the account is in use somewhere else), so the next
+    /// launch doesn't go online just to carry on with downloads.
+    private var choseOffline: Bool {
+        get { UserDefaults.standard.bool(forKey: "soulseek.choseOffline") }
+        set { UserDefaults.standard.set(newValue, forKey: "soulseek.choseOffline") }
+    }
+
+    /// Downloads left over from the last run carry on at launch, unless the user had gone offline.
+    var resumesDownloadsAtLaunch: Bool { activeDownloadCount > 0 && !choseOffline }
 
     private(set) var state: ConnectionState = .disconnected {
         didSet {
@@ -511,7 +598,7 @@ final class SoulseekModel {
         }
     }
 
-    /// Keeps a user's online status current (conversations and info sheets).
+    /// Keeps a user's online status current (conversations, info sheets, and uploaders).
     private func watch(_ user: String) {
         guard let client, case .connected = state, watchedUsers.insert(user).inserted else { return }
         Task { await client.watch(user: user) }
@@ -688,17 +775,47 @@ final class SoulseekModel {
     @ObservationIgnored private var flushTask: Task<Void, Never>?
     @ObservationIgnored private var downloadIndex: [UUID: Int] = [:]
 
+    // Keeping downloads going.
+    /// Where the queue is saved; nil keeps it in memory only.
+    @ObservationIgnored private var queueFile: SoulseekQueueFile?
+    /// The next interrupted download's retry.
+    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    /// Asks uploaders again, now and then, for files they haven't started sending.
+    @ObservationIgnored private var requeueTask: Task<Void, Never>?
+
+    /// How the model reaches the network; tests point it at a mock, with an account of their own
+    /// (nothing is read from or written to the keychain then) and shorter delays.
+    struct Network {
+        var server = SoulseekClient.defaultServer
+        var account: (username: String, password: String)?
+        /// The first automatic reconnect's delay; later ones double.
+        var reconnectDelay: TimeInterval = 5
+        /// How long to wait after each try at a download that was interrupted, in order; once
+        /// they run out, it has failed. About 3 hours in all.
+        var retryDelays: [TimeInterval] = [30, 120, 300, 900, 1800, 1800, 1800, 3600]
+        /// How often uploaders are asked again for what they haven't started sending.
+        var requeueInterval: TimeInterval = 15 * 60
+    }
+
+    @ObservationIgnored private let network: Network
+
     /// `chats` nil loads the saved conversations; `shareWalkURL` nil keeps what walks of the
     /// shared folder find in memory only.
-    init(chats: SoulseekChats? = nil, shareWalkURL: URL? = SlskShareWalk.defaultURL) {
+    init(chats: SoulseekChats? = nil, shareWalkURL: URL? = SlskShareWalk.defaultURL, network: Network = Network()) {
         self.chats = chats ?? SoulseekChats()
         self.shareWalkURL = shareWalkURL
+        self.network = network
+        if let account = network.account {
+            username = account.username
+            password = account.password
+        }
     }
 
     /// Goes online (or stays there). Lost connections are retried until `disconnect()`.
     func connect() {
         guard hasCredentials else { return }
         staysConnected = true
+        choseOffline = false
         watchForNetworkChanges()
         guard client == nil else { return }
         reconnectTask?.cancel()
@@ -709,6 +826,7 @@ final class SoulseekModel {
 
     func disconnect() {
         staysConnected = false
+        choseOffline = true
         reconnectTask?.cancel()
         reconnectTask = nil
         reconnectDate = nil
@@ -723,7 +841,7 @@ final class SoulseekModel {
         let generation = clientGeneration
         let (events, continuation) = AsyncStream.makeStream(of: SlskEvent.self)
         clientEvents[generation] = continuation
-        let client = SoulseekClient(username: username, password: password) { continuation.yield($0) }
+        let client = SoulseekClient(username: username, password: password, server: network.server) { continuation.yield($0) }
         self.client = client
         state = .connecting
         Task { [weak self] in
@@ -765,6 +883,7 @@ final class SoulseekModel {
         self.client = nil
         let generation = clientGeneration
         wishlistTask?.cancel()
+        stopRetryingDownloads()
         forgetUserStatuses()
         Task {
             await client.disconnect()
@@ -792,7 +911,7 @@ final class SoulseekModel {
     /// Tries again after a lost connection: after about 5 s, then 10, 20, … at most 5 minutes apart.
     private func scheduleReconnect() {
         guard staysConnected, hasCredentials else { return }
-        let delay = min(300, 5 * pow(2, Double(min(reconnectAttempts, 6))) * Double.random(in: 0.9 ... 1.1))
+        let delay = min(300, network.reconnectDelay * pow(2, Double(min(reconnectAttempts, 6))) * Double.random(in: 0.9 ... 1.1))
         reconnectAttempts += 1
         reconnectDate = Date().addingTimeInterval(delay)
         reconnectTask?.cancel()
@@ -875,23 +994,28 @@ final class SoulseekModel {
             reconnectAttempts = 0
             startWishlistLoop()
             for conversation in chats.conversations { watch(conversation.user) }
+            resumeDownloads()
         case .disconnected(let reason, let canReconnect):
             retireEvents(of: generation)
             guard isCurrent else { return }  // replaced, or disconnected on purpose
             client = nil
             wishlistTask?.cancel()
+            stopRetryingDownloads()
             forgetUserStatuses()
             state = reason.map { .failed($0) } ?? .disconnected
             if canReconnect {
                 scheduleReconnect()
             } else {
                 staysConnected = false
+                choseOffline = true
             }
         case .privateMessage(let message):
             receive(message)
         case .userStatus(let user, let status, let privileged):
+            let previous = userDetails[user]?.status
             userDetails[user, default: SoulseekUserDetails()].status = status
             userDetails[user, default: SoulseekUserDetails()].privileged = privileged
+            uploaderStatusChanged(user, from: previous, to: status)
         case .userStats(let user, let stats):
             userDetails[user, default: SoulseekUserDetails()].stats = stats
         case .wishlistInterval(let seconds):
@@ -900,13 +1024,7 @@ final class SoulseekModel {
             pendingResults.append((token, batch))
             scheduleFlush()
         case .downloadState(let id, let newState):
-            if case .transferring = newState {
-                pendingDownloadProgress[id] = newState
-                scheduleFlush()
-            } else {
-                pendingDownloadProgress[id] = nil
-                setDownloadState(id, newState)
-            }
+            applyDownloadState(id, newState, from: generation)
         case .uploadStarted(let id, let username, let path, let size):
             uploads.append(SoulseekUpload(id: id, username: username, remotePath: path, size: size))
             // Keep the history bounded; drop the oldest finished rows first.
@@ -964,13 +1082,53 @@ final class SoulseekModel {
         for (id, state) in uploadProgress { setUploadState(id, state) }
     }
 
+    /// A report from client `generation` on one of its downloads.
+    func applyDownloadState(_ id: UUID, _ newState: SlskDownloadState, from generation: Int) {
+        // A client that was replaced has no say over a download that's moved on to the next one,
+        // except that a file it finished is finished.
+        if let session = download(withID: id)?.session, session != generation {
+            guard case .finished = newState else { return }
+        }
+        if case .transferring = newState {
+            pendingDownloadProgress[id] = newState
+            scheduleFlush()
+            return
+        }
+        pendingDownloadProgress[id] = nil
+        setDownloadState(id, newState)
+        // The session it was with had already been replaced: the new one wouldn't know.
+        if newState == .waitingForConnection, generation != clientGeneration, case .connected = state {
+            start(id)
+        }
+    }
+
     private func setDownloadState(_ id: UUID, _ newState: SlskDownloadState) {
-        guard let index = downloadIndex[id], index < downloads.count, downloads[index].id == id,
-              downloads[index].state != .cancelled else { return }
+        guard let index = downloadIndex[id], index < downloads.count, downloads[index].id == id else { return }
+        // A try that's over can't change its download with a late report. Only a finished file
+        // does: it's there, whatever was decided about it meanwhile.
+        switch downloads[index].state {
+        case .waitingForConnection, .interrupted, .failed, .cancelled, .finished:
+            guard case .finished = newState else { return }
+        default:
+            break
+        }
         let was = downloads[index]
-        downloads[index].state = newState
+        switch newState {
+        case .interrupted(let reason):
+            noteInterruption(at: index, reason)
+        case .transferring(let received, _):
+            downloads[index].state = newState
+            // Getting further doesn't count against it, so a flaky peer can still finish.
+            if received > downloads[index].furthest {
+                downloads[index].furthest = received
+                downloads[index].tries = 0
+            }
+        default:
+            downloads[index].state = newState
+        }
         if case .finished(let url) = newState {
             downloads[index].localURL = url
+            downloads[index].retryDate = nil
             scheduleImport(of: url.deletingLastPathComponent())
         }
         let now = downloads[index]
@@ -1155,13 +1313,28 @@ final class SoulseekModel {
         }
     }
 
-    /// Re-requests a finished or failed download; a leftover partial file resumes where it stopped.
+    /// Re-requests a failed or cancelled download; a leftover partial file resumes where it stopped.
     func retry(_ id: SoulseekDownload.ID) {
         guard let index = downloadIndex[id], index < downloads.count, !downloads[index].isActive else { return }
         let item = downloads.remove(at: index)
+        let isUnderWay = downloads.contains { $0.username == item.username && $0.remotePath == item.remotePath && $0.isActive }
+        // A new ID: the client remembers cancels of IDs it hasn't seen.
+        let id = UUID()
+        if !isUnderWay {
+            downloads.append(SoulseekDownload(id: id, username: item.username, remotePath: item.remotePath, size: item.size,
+                                              partURL: item.partURL, localURL: item.localURL))
+        }
         downloadsChanged()
         connect()
-        enqueue(username: item.username, remotePath: item.remotePath, size: item.size)
+        if !isUnderWay { start(id) }
+    }
+
+    /// Tries an interrupted download now rather than when its turn comes.
+    func tryNow(_ id: SoulseekDownload.ID) {
+        guard let download = download(withID: id), case .interrupted = download.state else { return }
+        connect()
+        start(id)
+        scheduleRetries()
     }
 
     /// Stops active downloads and throws away what arrived so far.
@@ -1169,16 +1342,26 @@ final class SoulseekModel {
         var changed = false
         for id in ids {
             guard let index = downloadIndex[id], index < downloads.count, downloads[index].isActive else { continue }
+            let partURL = downloads[index].partURL
+            let isWithClient: Bool
+            switch downloads[index].state {
+            case .waitingForConnection, .interrupted: isWithClient = false
+            default: isWithClient = downloads[index].session == clientGeneration
+            }
             downloads[index].state = .cancelled
+            downloads[index].retryDate = nil
             pendingDownloadProgress[id] = nil
             changed = true
-            if let client {
-                Task { await client.cancelDownload(id) }
+            if isWithClient, let client {
+                Task { await client.cancelDownload(id, partURL: partURL) }
             } else {
-                SlskTransferFiles.remove(downloads[index].partURL)
+                SlskTransferFiles.remove(partURL)
             }
         }
-        if changed { downloadsChanged() }
+        if changed {
+            downloadsChanged()
+            scheduleRetries()
+        }
     }
 
     /// Asks before stopping every active download.
@@ -1257,6 +1440,182 @@ final class SoulseekModel {
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         if folders != downloadFolders { downloadFolders = folders }
+        saveQueue()
+    }
+
+    // MARK: Keeping downloads going
+
+    /// Picks up what the last run saved, from the queue at `url`, which is kept there from now
+    /// on. Unfinished downloads wait to be asked for once connected.
+    func restoreDownloads(from url: URL) {
+        let file = SoulseekQueueFile(url: url)
+        queueFile = file
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
+            file.finishSaving()
+        }
+        let saved = file.load()
+        downloads = saved.downloads.map { saved in
+            SoulseekDownload(
+                id: saved.id, username: saved.username, remotePath: saved.remotePath, size: saved.size,
+                partURL: URL(fileURLWithPath: saved.partPath), localURL: URL(fileURLWithPath: saved.destinationPath),
+                state: saved.failure.map { .failed($0) } ?? .waitingForConnection)
+        }
+        pendingImportFolders = Set(saved.imports.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        downloadsChanged()
+        if !pendingImportFolders.isEmpty { scheduleImport() }
+    }
+
+    /// Waits until the queue as it stands is on disk (for tests; quitting does this too).
+    func finishSavingQueue() {
+        queueFile?.finishSaving()
+    }
+
+    private func saveQueue() {
+        guard let queueFile else { return }
+        var saved = SoulseekSavedQueue(imports: pendingImportFolders.map(\.path).sorted())
+        for download in downloads {
+            let failure: String?
+            switch download.state {
+            case .finished, .cancelled: continue
+            case .failed(let reason): failure = reason
+            default: failure = nil
+            }
+            saved.downloads.append(SoulseekSavedQueue.Download(
+                id: download.id, username: download.username, remotePath: download.remotePath, size: download.size,
+                partPath: download.partURL.path, destinationPath: download.localURL.path, failure: failure))
+        }
+        queueFile.save(saved)
+    }
+
+    /// Hands a download to the client, once there is one.
+    private func start(_ id: SoulseekDownload.ID) {
+        guard let index = downloadIndex[id], index < downloads.count, downloads[index].id == id else { return }
+        downloads[index].state = .connecting
+        downloads[index].retryDate = nil
+        downloads[index].session = nil
+        let row = downloads[index]
+        let request = SlskDownloadRequest(
+            id: id, username: row.username, remotePath: row.remotePath, size: row.size,
+            partURL: row.partURL, destinationURL: row.localURL)
+        Task {
+            await waitForConnection()
+            guard download(withID: id)?.state == .connecting else { return }  // cancelled meanwhile
+            guard let client, case .connected = state, let index = downloadIndex[id] else {
+                setDownloadState(id, .waitingForConnection)
+                return
+            }
+            downloads[index].session = clientGeneration
+            watch(request.username)
+            await client.download(request)
+        }
+    }
+
+    /// Back online: what was waiting for the connection is asked for.
+    private func resumeDownloads() {
+        for download in downloads where download.state == .waitingForConnection { start(download.id) }
+        scheduleRetries()
+        startRequeueLoop()
+    }
+
+    /// The session ended: what was waiting for its next try now waits for the next session.
+    private func stopRetryingDownloads() {
+        retryTask?.cancel()
+        retryTask = nil
+        requeueTask?.cancel()
+        requeueTask = nil
+        for index in downloads.indices {
+            guard case .interrupted = downloads[index].state else { continue }
+            downloads[index].state = .waitingForConnection
+            downloads[index].retryDate = nil
+        }
+    }
+
+    /// Another try later, or the end of it once there have been enough. An uploader known to be
+    /// offline isn't held against the download: it just waits for them.
+    private func noteInterruption(at index: Int, _ reason: String) {
+        let user = downloads[index].username
+        if userDetails[user]?.status == .offline {
+            downloads[index].state = .interrupted("\(user) is offline")
+            downloads[index].retryDate = nil
+        } else if downloads[index].tries < network.retryDelays.count {
+            downloads[index].state = .interrupted(reason)
+            downloads[index].retryDate = Date().addingTimeInterval(network.retryDelays[downloads[index].tries])
+            downloads[index].tries += 1
+        } else {
+            downloads[index].state = .failed(reason)
+            downloads[index].retryDate = nil
+        }
+        scheduleRetries()
+    }
+
+    /// Arms the timer for the next interrupted download due, while connected.
+    private func scheduleRetries() {
+        retryTask?.cancel()
+        retryTask = nil
+        guard case .connected = state else { return }
+        let due = downloads.lazy.filter { if case .interrupted = $0.state { true } else { false } }.compactMap(\.retryDate).min()
+        guard let due else { return }
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(max(0, due.timeIntervalSinceNow)))
+            guard let self, !Task.isCancelled else { return }
+            self.retryTask = nil
+            self.retryDueDownloads()
+        }
+    }
+
+    private func retryDueDownloads() {
+        let now = Date()
+        for download in downloads {
+            if case .interrupted = download.state, let date = download.retryDate, date <= now { start(download.id) }
+        }
+        scheduleRetries()
+    }
+
+    /// An uploader's status: one who went offline is waited for, and one who came back gets asked
+    /// again at once for everything, since their queue may not have survived.
+    private func uploaderStatusChanged(_ user: String, from previous: SlskUserStatus?, to status: SlskUserStatus) {
+        let rows = downloads.filter { $0.username == user && $0.isActive }
+        guard !rows.isEmpty else { return }
+        if status == .offline {
+            for row in rows {
+                guard case .interrupted = row.state, let index = downloadIndex[row.id] else { continue }
+                downloads[index].state = .interrupted("\(user) is offline")
+                downloads[index].retryDate = nil
+            }
+            scheduleRetries()
+        } else if previous == .offline {
+            for row in rows {
+                if case .interrupted = row.state { start(row.id) }
+            }
+            scheduleRetries()
+            askAgain(rows)
+        }
+    }
+
+    /// Now and then, uploaders are asked again for what they haven't started sending.
+    private func startRequeueLoop() {
+        requeueTask?.cancel()
+        requeueTask = Task { [weak self, interval = network.requeueInterval] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(interval))
+                guard let self, !Task.isCancelled else { return }
+                self.askAgain(self.downloads)
+            }
+        }
+    }
+
+    private func askAgain(_ rows: [SoulseekDownload]) {
+        guard let client else { return }
+        let waiting = rows.filter {
+            switch $0.state {
+            case .requested, .queued: true
+            default: false
+            }
+        }
+        for (user, files) in Dictionary(grouping: waiting, by: \.username) {
+            let ids = files.map(\.id)
+            Task { await client.requeue(ids, from: user) }
+        }
     }
 
     /// Points finished downloads at their files' new places after they were moved (old path → new URL).
@@ -1284,29 +1643,13 @@ final class SoulseekModel {
         }) else { return }
 
         let folder = URL(fileURLWithPath: downloadFolderPath, isDirectory: true)
-        let destination = Self.localDestination(for: remotePath, downloadsFolder: folder)
-        let request = SlskDownloadRequest(
-            id: UUID(),
-            username: username,
-            remotePath: remotePath,
-            size: size,
-            partURL: Self.partialFileURL(username: username, remotePath: remotePath, downloadsFolder: folder),
-            destinationURL: destination
-        )
+        let id = UUID()
         downloads.append(SoulseekDownload(
-            id: request.id, username: username, remotePath: remotePath,
-            size: size, partURL: request.partURL, localURL: destination))
+            id: id, username: username, remotePath: remotePath, size: size,
+            partURL: Self.partialFileURL(username: username, remotePath: remotePath, downloadsFolder: folder),
+            localURL: Self.localDestination(for: remotePath, downloadsFolder: folder)))
         downloadsChanged()
-
-        Task {
-            await waitForConnection()
-            guard download(withID: request.id)?.state != .cancelled else { return }
-            guard let client, case .connected = state else {
-                setDownloadState(request.id, .failed("Not connected"))
-                return
-            }
-            await client.download(request)
-        }
+        start(id)
     }
 
     /// Local destination for a remote file: the download folder, plus the file's remote parent
@@ -1386,8 +1729,11 @@ final class SoulseekModel {
 
     /// Imports finished downloads' folders after a short settle, so an album lands as one scan.
     /// Retries while the library is busy with another scan.
-    private func scheduleImport(of folder: URL) {
-        pendingImportFolders.insert(folder)
+    private func scheduleImport(of folder: URL? = nil) {
+        if let folder {
+            pendingImportFolders.insert(folder)
+            saveQueue()
+        }
         importTask?.cancel()
         importTask = Task {
             try? await Task.sleep(for: .seconds(3))
@@ -1397,6 +1743,7 @@ final class SoulseekModel {
                 guard !folders.isEmpty else { return }
                 if importFolders?(folders) == true {
                     pendingImportFolders.subtract(folders)
+                    saveQueue()
                     notifyFinishedFolders(folders)
                     return
                 }
