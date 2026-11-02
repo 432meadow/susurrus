@@ -987,7 +987,7 @@ actor SoulseekClient {
         onEvent(.downloadState(id: request.id, state: .connecting))
 
         guard let channel = await channel(to: request.username) else {
-            interruptDownload(request.id, "Can't reach \(request.username)")
+            interruptDownload(request.id, "Can't be reached")
             return
         }
         guard downloads[request.id] != nil else { return }  // disconnected or cancelled meanwhile
@@ -1070,7 +1070,7 @@ actor SoulseekClient {
         do {
             try await connection.send(SlskPeerMessage.transferResponse(token: request.token, allowed: true))
         } catch {
-            interruptDownload(id, "Couldn't answer \(username)")
+            interruptDownload(id, "Couldn't accept the transfer")
         }
     }
 
@@ -1175,7 +1175,7 @@ actor SoulseekClient {
         if sentTooMuch {
             // Cut off at that size it's a damaged file, and a retry would take these bytes as complete.
             SlskTransferFiles.remove(partURL)
-            failDownload(id, "\(user) sent more than the file's size: it may have changed since it was listed")
+            failDownload(id, "Sent more than the file's size: it may have changed since it was listed")
         } else if received >= expected {
             await completeDownload(id)
         } else {

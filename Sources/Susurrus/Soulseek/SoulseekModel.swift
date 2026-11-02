@@ -1535,7 +1535,7 @@ final class SoulseekModel {
     private func noteInterruption(at index: Int, _ reason: String) {
         let user = downloads[index].username
         if userDetails[user]?.status == .offline {
-            downloads[index].state = .interrupted("\(user) is offline")
+            downloads[index].state = .interrupted("Offline")
             downloads[index].retryDate = nil
         } else if downloads[index].tries < network.retryDelays.count {
             downloads[index].state = .interrupted(reason)
@@ -1579,7 +1579,7 @@ final class SoulseekModel {
         if status == .offline {
             for row in rows {
                 guard case .interrupted = row.state, let index = downloadIndex[row.id] else { continue }
-                downloads[index].state = .interrupted("\(user) is offline")
+                downloads[index].state = .interrupted("Offline")
                 downloads[index].retryDate = nil
             }
             scheduleRetries()

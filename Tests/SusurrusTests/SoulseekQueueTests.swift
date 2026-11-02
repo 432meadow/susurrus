@@ -76,7 +76,7 @@ import Testing
 
         model.download([result(size: 1000)])
         try await waitUntil { if case .failed = state(of: model) { true } else { false } }
-        #expect(state(of: model) == .failed("Can't reach mockpeer"))
+        #expect(state(of: model) == .failed("Can't be reached"))
         #expect(model.downloads.first?.tries == 2)
         #expect(model.activeDownloadCount == 0)
     }
@@ -228,12 +228,12 @@ import Testing
         defer { model.disconnect() }
 
         model.download([result(size: 1000)])
-        try await waitUntil { state(of: model) == .interrupted("mockpeer is offline") }
+        try await waitUntil { state(of: model) == .interrupted("Offline") }
         let row = try #require(model.downloads.first)
         #expect(row.retryDate == nil && row.tries == 0, "it isn't held against the download")
         #expect(mock.watchedUsers.contains("mockpeer"))
         try await Task.sleep(for: .milliseconds(100))
-        #expect(state(of: model) == .interrupted("mockpeer is offline"), "no retries while they're away")
+        #expect(state(of: model) == .interrupted("Offline"), "no retries while they're away")
 
         mock.reachability = .direct
         try await mock.sendStatus(of: "mockpeer", .online)
