@@ -91,8 +91,8 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   30 days, 12 months or all time; top 10 artists, albums and tracks by time listened (click an
   artist to open their page, double-click anything to play it); listening by hour of day and
   average per weekday; a GitHub-style calendar of the last 12 months; and the most skipped
-  tracks. Every listen is logged with the time actually spent playing (pauses and waiting for
-  a network share left out) and how it ended: finished, **skipped** (moved on before the last 10 s, or
+  tracks. Every listen is logged with the time actually spent playing, going by the audio itself
+  (pauses, waiting for a network share, a sleeping Mac and a stalled device left out), and how it ended: finished, **skipped** (moved on before the last 10 s, or
   last 10% of a short track) or stopped. Listens under a second aren't kept. Plays from before
   the log existed count their track's length, and the view says so. Skip counts are searchable
   (`skips:>2`) and there's an optional Skips column. Clear History also clears the log.
@@ -221,7 +221,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   never leaves half a file.
 
 **Playback**
-- Gapless playback; shuffle (⌥⌘S), repeat off/all/one (⌘R).
+- Gapless playback, across sample rates and between mono and stereo; shuffle (⌥⌘S), repeat
+  off/all/one (⌘R). The one exception is a surround file: it's mixed down to stereo, and starts
+  with a short gap when the track next to it is in another format.
 - **Up Next** panel (⌥⌘U): Play Next (⌥↩), Add to Queue (⌥⇧↩), reorder, remove, jump.
 - Play counts and last-played are recorded once half a track (or 4 minutes) has actually been
   heard: seeking ahead, or resuming a track restored past its middle, doesn't count one.
@@ -230,7 +232,8 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   or by dragging a track onto it. Equal-power crossfader, auto crossfade over 4–32 s (⇧⌘X),
   3-band EQ with kills, channel faders, tempo ±8% with hold-to-nudge and BPM match, cue point,
   and a loudness overview to click-seek in. Knobs, faders, tempo and the crossfader also follow
-  the scroll wheel. **Continue in Mixer** moves the playing track onto a deck at the same spot.
+  the scroll wheel. **Continue in Mixer** moves the playing track onto a deck at the same spot,
+  and it stays one listen: heard partly in each place, it counts once.
   The mixer and the queue player take turns: starting one pauses the other. There's one output,
   so no headphone pre-listen.
   - **Beats** (⌃⌘B): both decks close up, one above the other, scrolling past a shared playhead
@@ -244,8 +247,14 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
     moves the crossfader (⌃⌘← / ⌃⌘→).
   - Deck plays count and show up in History and Stats. Auditioning a track or mixing it out
     early isn't counted as a skip.
-- Output device picker and AirPlay button in the now-playing bar.
-- Media keys, Control Center / Now Playing widget, headphone buttons.
+- Output device picker and AirPlay button in the now-playing bar. **System Output** follows the
+  Mac's default output as it changes. If a chosen device goes away, playback carries on through the
+  system output and goes back to the device when it returns (even after a relaunch, until you pick
+  something else).
+- Media keys, Control Center / Now Playing widget, headphone buttons. While a deck is playing
+  they're the mixer's: Play/Pause pauses both decks and starts them again together, and Now Playing
+  shows the deck most in the mix. Next and Previous do nothing then, since starting the queue would
+  stop the mix. Space, ⌘P and the now-playing bar always drive the queue player.
 - Menu bar mini-player; the app keeps running when the window is closed.
 - **Help ▸ Report a Bug…** opens a new GitHub issue in the browser, filled in with what you wrote
   and, if you want, diagnostics: versions, Mac model, library size and formats, whether the music
@@ -484,7 +493,7 @@ volume (SMB, AFP, NFS) can arrive slowly (the share susurrus was developed again
 | `Sources/Susurrus/Reporting/` | Bug reports: event log, diagnostics, redaction, crash report summaries, the GitHub issue link |
 | `Sources/Susurrus/UI/` | Track table (NSTableView), shared track and album menus, sidebar, albums, browser, Up Next, Get Info, smart editor, EQ, mixer, import and export sheets, activity button and notices, Soulseek (+ messages and user info), settings, menu bar |
 | `Sources/ObjCSupport/` | Catches NSExceptions (predicate evaluation, audio graph connections) |
-| `Tests/SusurrusTests/` | 341 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download, moving by a download's own tags, picking up a move cut short at each step), tag writes that wait for a share or file and are retried, fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, sizes that don't add up, connection budgets, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, the download queue (retries, lost connections, uploaders coming and going, surviving a quit), and saved conversations |
+| `Tests/SusurrusTests/` | 379 tests (plus one against the live MusicBrainz and Cover Art Archive, run with `SUSURRUS_LIVE_TESTS=1`): listening stats, the listen log (store, v2→v3 upgrade, player skip/pause/stop tracking), discography matching, artist index, smart playlist predicates, albums/artwork, library editing, history/removal/saved tag writes and the v1→v2 upgrade, search scopes, duplicates, missing-file checks, tag reading and writing (on generated files), BPM detection (generated drum patterns, WAV and FLAC excerpts), beat grids (click tracks) and keys (chord progressions), player, mixer, chains across sample rates and channel counts (heard through a tap), output devices (one that really comes and goes, a stand-in for the system's default), media keys over a live mix, Continue in Mixer's listens, taking over casting's folders and settings, import and export (M3U round trips and other apps' playlists, a generated `Library.xml` and the import plan, the Rekordbox XML shape), bug reports (redaction, issue links, crash summaries, event log), release matching (tagged and untagged files, multi-disc, near misses, edits, folder names) and covers in MP3/FLAC/M4A tags, moving matched downloads to the library folder (renamed copies, size checks, disc folders flattened, what's left in the download folder, waiting for a folder that isn't there, applying a release to a download, moving by a download's own tags, picking up a move cut short at each step), tag writes that wait for a share or file and are retried, fetched and folder covers, Soulseek codec + loopback client tests (search, wishlist, browse, download, resume, denial, sizes that don't add up, connection budgets, blocking, serving searches + uploads, upload speed limit, private messages and acks, offline messages, user info and stats) against a mock server, the download queue (retries, lost connections, uploaders coming and going, surviving a quit), and saved conversations |
 
 ## Known issues
 
@@ -495,5 +504,9 @@ volume (SMB, AFP, NFS) can arrive slowly (the share susurrus was developed again
   compacted.)
 - The smart playlist match count can take a few seconds on the full library.
 - Ogg/Opus aren't playable (AVFoundation can't decode them; none are in the current library).
-- Output-device switching mid-track (headphones unplugged, AirPlay) is handled and covered by
-  tests that simulate the engine stopping, but not yet tested on real hardware changes.
+- A track chained on at another sample rate goes through a second conversion until the next seek,
+  skip or long pause, which takes a little off the very top: nothing below 16 kHz, about 2 dB more
+  at 18 kHz, and more above that.
+- Output-device switching mid-track (headphones unplugged, AirPlay, the default output moving) is
+  handled and covered by tests, on a temporary device that really comes and goes and a stand-in for
+  the system's default, but not yet tested on real hardware changes.

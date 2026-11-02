@@ -126,13 +126,18 @@ import Testing
 
 }
 
-/// Writes short stereo sine-wave WAV files for tests.
+/// Writes short sine-wave WAV files for tests.
 enum ToneFile {
     /// `format`: linear PCM (WAV/AIFF by extension), or an encoded format such as AAC or FLAC.
+    /// `channels`: 1, 2 or 6 (5.1). `onlyChannel` leaves the others silent.
     static func write(to url: URL, seconds: Double, frequency: Double = 440, sampleRate: Double = 44_100,
+                      channels: AVAudioChannelCount = 2, onlyChannel: Int? = nil,
                       format formatID: AudioFormatID = kAudioFormatLinearPCM) throws {
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)!
-        var settings: [String: Any] = [AVFormatIDKey: formatID, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: 2]
+        var settings: [String: Any] = [AVFormatIDKey: formatID, AVSampleRateKey: sampleRate, AVNumberOfChannelsKey: channels]
+        if channels == 6 {
+            let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_MPEG_5_1_A)!
+            settings[AVChannelLayoutKey] = Data(bytes: layout.layout, count: MemoryLayout<AudioChannelLayout>.size)
+        }
         switch formatID {
         case kAudioFormatLinearPCM:
             settings[AVLinearPCMBitDepthKey] = 16
@@ -144,14 +149,20 @@ enum ToneFile {
         }
         let file = try AVAudioFile(forWriting: url, settings: settings)
         let frames = AVAudioFrameCount(seconds * sampleRate)
-        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: frames)!
         buffer.frameLength = frames
-        for channel in 0..<2 {
-            let samples = buffer.floatChannelData![channel]
-            for frame in 0..<Int(frames) {
-                samples[frame] = Float(sin(2 * .pi * frequency * Double(frame) / sampleRate) * 0.2)
-            }
+        let tone = (0..<Int(frames)).map { Float(sin(2 * .pi * frequency * Double($0) / sampleRate) * 0.2) }
+        for channel in 0..<Int(channels) where onlyChannel == nil || onlyChannel == channel {
+            tone.withUnsafeBufferPointer { buffer.floatChannelData![channel].update(from: $0.baseAddress!, count: tone.count) }
         }
         try file.write(from: buffer)
+    }
+
+    /// `write`, off the main actor: suites that watch the clock share it, and long tones take a while.
+    static func make(at url: URL, seconds: Double, frequency: Double = 440, sampleRate: Double = 44_100,
+                     channels: AVAudioChannelCount = 2, onlyChannel: Int? = nil) async throws {
+        try await Task.detached {
+            try write(to: url, seconds: seconds, frequency: frequency, sampleRate: sampleRate, channels: channels, onlyChannel: onlyChannel)
+        }.value
     }
 }

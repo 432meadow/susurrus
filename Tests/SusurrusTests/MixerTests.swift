@@ -204,4 +204,95 @@ import Testing
         #expect(mixer.a.currentTime >= position - 0.01, "carries on rather than going back to where play was pressed")
         mixer.pauseAll()
     }
+
+    @Test func aDeckThatStallsBooksNoListeningTime() async throws {
+        let mixer = makeMixer()
+        var listens: [ListenRecord] = []
+        mixer.onListenEnded = { listens.append($1) }
+        let url = folder.appendingPathComponent("7.wav")
+        try await ToneFile.make(at: url, seconds: 8)
+        let track = Track(id: 7)
+        track.path = url.path
+        var ready = false
+        mixer.load(track, on: .a) { _ in ready = true }
+        #expect(await waitUntil { ready })
+        let start = Date()
+        mixer.a.play()
+        #expect(await waitUntil { mixer.a.currentTime > 0.5 })
+        let engine = try #require(mixer.a.node.engine)
+        engine.pause()
+        let stalled = Date()
+        try? await Task.sleep(for: .seconds(1.5))
+        let stall = Date().timeIntervalSince(stalled)
+        try engine.start()
+        try? await Task.sleep(for: .seconds(1))
+        mixer.a.eject()
+        let played = Date().timeIntervalSince(start) - stall
+        let seconds = listens.first?.seconds ?? 0
+        #expect(seconds > 1)
+        // At most the update that sees the output come back can take in a tick's worth of the stall.
+        #expect(seconds <= played + 0.5, "\(seconds)s counted of \(played)s played; the \(stall)s stall shouldn't be")
+    }
+}
+
+/// What used to skip tracks: the EQ straight after the player node, as it was.
+@Suite(.serialized) struct EngineConnectionTests {
+    private let cd = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!
+    private let other = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
+
+    private func runningEngine() throws -> (AVAudioEngine, AVAudioPlayerNode, AVAudioUnitEQ) {
+        let engine = AVAudioEngine(), node = AVAudioPlayerNode(), eq = AVAudioUnitEQ(numberOfBands: 10)
+        engine.attach(node)
+        engine.attach(eq)
+        engine.mainMixerNode.outputVolume = 0
+        try engine.connectChecked(node, to: eq, format: cd)
+        try engine.connectChecked(eq, to: engine.mainMixerNode, format: cd)
+        try engine.start()
+        return (engine, node, eq)
+    }
+
+    @Test func aRefusalComesBackInTheEnginesOwnWords() {
+        // Asking outright, with a node it doesn't have, since nothing playable is refused any more.
+        let engine = AVAudioEngine()
+        #expect {
+            try engine.connectChecked(AVAudioPlayerNode(), to: engine.mainMixerNode, format: cd)
+        } throws: { error in
+            error.localizedDescription.contains("required condition")
+        }
+    }
+
+    @Test func aRunningEngineWontChangeTheFormatOfAnEffect() throws {
+        let (engine, node, eq) = try runningEngine()
+        defer { engine.stop() }
+        engine.disconnectNodeOutput(node)
+        #expect(throws: (any Error).self) { try engine.connectChecked(node, to: eq, format: other) }
+        #expect(engine.isRunning, "and carries on: it was only the connection that failed")
+    }
+
+    @Test func stoppingItIsWhatLetsItThrough() throws {
+        let (engine, node, eq) = try runningEngine()
+        defer { engine.stop() }
+        engine.disconnectNodeOutput(node)
+        try engine.connectStoppingIfRefused(node, to: eq, format: other)
+        #expect(!engine.isRunning)
+        engine.disconnectNodeOutput(eq)
+        try engine.connectChecked(eq, to: engine.mainMixerNode, format: other)
+        try engine.start()
+    }
+
+    @Test func aMixerAheadOfItTakesAnyFormatWhileRunning() throws {
+        let engine = AVAudioEngine(), node = AVAudioPlayerNode(), input = AVAudioMixerNode(), eq = AVAudioUnitEQ(numberOfBands: 10)
+        for attached in [node, input, eq] { engine.attach(attached) }
+        engine.mainMixerNode.outputVolume = 0
+        try engine.connectChecked(node, to: input, format: cd)
+        try engine.connectChecked(input, to: eq, format: cd)
+        try engine.connectChecked(eq, to: engine.mainMixerNode, format: cd)
+        try engine.start()
+        defer { engine.stop() }
+        for rate in [48_000.0, 96_000, 22_050] {
+            engine.disconnectNodeOutput(node)
+            try engine.connectChecked(node, to: input, format: AVAudioFormat(standardFormatWithSampleRate: rate, channels: 2)!)
+            #expect(engine.isRunning)
+        }
+    }
 }

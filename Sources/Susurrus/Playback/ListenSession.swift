@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 /// One listen in progress, for the queue player and the mixer's decks alike: how long the track
@@ -11,9 +12,14 @@ struct ListenSession {
     private(set) var isCounted = false
     private var listen: ListenRecord
     private var updatedAt: Date
+    /// The audio clock at the last update that had one.
+    private var clockAtUpdate: TimeInterval = 0
 
     /// A play is half the track, or this much of a long one.
     static let playThreshold: TimeInterval = 240
+    /// The most one update can add. They come twice a second, so this only bites when a Mac wakes
+    /// from sleep with a clock that kept counting.
+    static let longestUpdate: TimeInterval = 5
 
     init(_ track: Track, now: Date = Date()) {
         self.track = track
@@ -26,11 +32,20 @@ struct ListenSession {
         duration > 0 && seconds >= min(duration / 2, playThreshold)
     }
 
-    /// Adds the time since the last update if the track was audible all along (not paused, loading
-    /// or waiting for data). Call before anything changes whether it's audible.
-    mutating func update(audible: Bool, now: Date = Date()) {
-        if audible { listen.seconds += now.timeIntervalSince(updatedAt) }
-        updatedAt = now
+    /// Adds what's been heard since the last update, if the track was audible all along (not paused,
+    /// loading or waiting for data). Call before anything changes whether it's audible.
+    ///
+    /// `clock` is the node's `renderedSeconds`. Time only counts as far as that clock has moved, so
+    /// a sleeping Mac or a stalled device isn't listening, and only as far as real time has passed,
+    /// since the clock can jump ahead when the output comes back.
+    mutating func update(audible: Bool, clock: TimeInterval?, now: Date = Date()) {
+        defer { updatedAt = now }
+        guard let clock else { return }
+        defer { clockAtUpdate = clock }
+        guard audible else { return }
+        // The clock starts over whenever the node does.
+        let played = clock >= clockAtUpdate ? clock - clockAtUpdate : clock
+        listen.seconds += max(0, min(played, now.timeIntervalSince(updatedAt), Self.longestUpdate))
     }
 
     /// True the first time enough has been heard to count as a play.
@@ -47,5 +62,16 @@ struct ListenSession {
         ended.outcome = outcome
         ended.position = position
         return ended
+    }
+}
+
+extension AVAudioPlayerNode {
+    /// How much audio the node has rendered since it last started, by its own clock: what a listen
+    /// goes by. nil while it isn't rendering (paused, or the engine stopped).
+    var renderedSeconds: TimeInterval? {
+        guard engine?.isRunning == true, let nodeTime = lastRenderTime,
+              let playerTime = playerTime(forNodeTime: nodeTime) else { return nil }
+        // It reads a little before the start until the node's first render after play.
+        return max(0, Double(playerTime.sampleTime) / playerTime.sampleRate)
     }
 }

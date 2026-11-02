@@ -15,7 +15,7 @@ NSArray *_Nullable MMFilterWithPredicate(NSArray *objects, NSPredicate *predicat
 @class AVAudioEngine, AVAudioNode, AVAudioFormat;
 
 /// `[engine connect:from to:to format:format]`, returning NO instead of raising when
-/// AVAudioEngine rejects the format (e.g. unusual multichannel layouts).
+/// AVAudioEngine refuses (e.g. a format change it can't make while running).
 BOOL MMConnectNodes(AVAudioEngine *engine, AVAudioNode *from, AVAudioNode *to, AVAudioFormat *_Nullable format, NSError *_Nullable *_Nullable error);
 
 NS_ASSUME_NONNULL_END

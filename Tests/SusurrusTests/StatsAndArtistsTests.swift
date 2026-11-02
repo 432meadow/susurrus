@@ -262,18 +262,23 @@ import Testing
     @Test func pausesDontCountAndStoppingEndsTheListen() async {
         var listens: [ListenRecord] = []
         let player = makePlayer { listens.append($0) }
+        let start = Date()
         player.play([tracks[0]], startingAt: 0)
         #expect(await waitUntil { player.isPlaying && player.currentTime > 1.0 })
         player.togglePlayPause()
+        let paused = Date()
         try? await Task.sleep(for: .seconds(1.2))
+        let pause = Date().timeIntervalSince(paused)
         player.togglePlayPause()
         try? await Task.sleep(for: .seconds(0.4))
         player.stop()
+        let played = Date().timeIntervalSince(start) - pause
 
         #expect(listens.count == 1)
         #expect(listens.first?.outcome == .stopped)
         let seconds = listens.first?.seconds ?? 0
-        #expect((1.2...2.2).contains(seconds), "\(seconds)s counted; the 1.2 s pause shouldn't be")
+        #expect(seconds > 1.2)
+        #expect(seconds <= played, "\(seconds)s counted of \(played)s played; the \(pause)s pause shouldn't be")
     }
 
     @Test func listensUnderASecondAreDropped() async {
