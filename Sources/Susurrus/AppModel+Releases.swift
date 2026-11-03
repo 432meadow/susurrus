@@ -422,10 +422,20 @@ extension AppModel {
         return isDiscFolder && parent != root ? parent : folder
     }
 
-    /// Library tracks at or under a folder.
+    /// Library tracks at or under a folder. Scans record a file's real path, so a folder reached
+    /// through a symlink (/var is /private/var) is looked at both ways.
     func tracks(under folder: URL) -> [Track] {
-        let prefix = folder.standardizedFileURL.path + "/"
-        return tracks.filter { $0.path.hasPrefix(prefix) }
+        let standardized = folder.standardizedFileURL.path
+        let prefixes = Set([standardized, Self.realPath(standardized) ?? standardized]).map { $0 + "/" }
+        return tracks.filter { track in prefixes.contains { track.path.hasPrefix($0) } }
+    }
+
+    /// The path with every symlink resolved, as the file system spells it (Foundation's own
+    /// resolution takes /private off again).
+    nonisolated static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     // MARK: Find Missing Covers

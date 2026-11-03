@@ -79,20 +79,27 @@ final class PaletteRowView: NSTableRowView {
 }
 
 extension View {
-    /// Swaps a SwiftUI `List` row's system selection highlight for the slate wash.
-    func paletteSelection(_ isSelected: Bool) -> some View {
-        listRowBackground(SelectionWash(isSelected: isSelected))
+    /// Swaps a SwiftUI `List` row's system selection highlight for the slate wash. While
+    /// `isDropTarget`, the row lights up in the accent instead: what's being dragged lands here.
+    func paletteSelection(_ isSelected: Bool, isDropTarget: Bool = false) -> some View {
+        listRowBackground(SelectionWash(isSelected: isSelected, isDropTarget: isDropTarget))
     }
 }
 
 private struct SelectionWash: View {
     let isSelected: Bool
+    var isDropTarget = false
     @Environment(\.controlActiveState) private var activeState
 
     var body: some View {
         ZStack {
             NativeSelectionOff()
-            if isSelected {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Palette.warm.opacity(0.22))
+                    .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).strokeBorder(Palette.warm, lineWidth: 2))
+                    .padding(.horizontal, 10)
+            } else if isSelected {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .fill(Color(nsColor: Palette.selectionNS(emphasized: activeState != .inactive)))
                     .padding(.horizontal, 10)

@@ -145,6 +145,10 @@ final class AppModel {
     @ObservationIgnored var albumMoveTask: Task<Void, Never>?
     /// Download folders Move to Library is looking up on MusicBrainz, before they're queued.
     var preparingAlbumMoves = Set<String>()
+    /// Finds the releases a download might be, best first (tests put something offline here).
+    @ObservationIgnored var releaseCandidates: ([ReleaseMatcher.Input], String, String) async throws -> [ReleaseMatcher.Match] = {
+        try await ReleaseIdentifier.candidates(for: $0, artist: $1, album: $2)
+    }
 
     // MARK: Artists
 

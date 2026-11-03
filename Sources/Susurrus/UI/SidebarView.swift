@@ -7,6 +7,8 @@ struct SidebarView: View {
     @FocusState private var isRenameFocused: Bool
     @State private var pendingDelete: Playlist?
     @State private var confirmClearHistory = false
+    /// The playlist a drag is over right now, and what the drag would do there.
+    @State private var dropTarget: (id: Int64, drop: PlaylistDrop)?
 
     var body: some View {
         @Bindable var model = model
@@ -115,7 +117,8 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func row(for playlist: Playlist) -> some View {
-        Group {
+        let drop = dropTarget.flatMap { $0.id == playlist.id ? $0.drop : nil }
+        HStack {
             if model.renamingPlaylistID == playlist.id {
                 TextField("Name", text: $renameText)
                     .focused($isRenameFocused)
@@ -128,15 +131,31 @@ struct SidebarView: View {
                 Label(playlist.name, systemImage: playlist.systemImage)
                     .help(playlist.predicateFormat ?? playlist.name)
             }
+            if let drop {
+                // Says what a drop does: tracks go in, a playlist goes into the folder.
+                Spacer(minLength: 4)
+                Image(systemName: drop == .addTracks ? "plus.circle.fill" : "folder.badge.plus")
+                    .foregroundStyle(Palette.warm)
+                    .accessibilityLabel(drop == .addTracks ? "Drop to add to this playlist" : "Drop to move into this folder")
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .tag(SidebarItem.playlist(playlist.id))
         .id(SidebarItem.playlist(playlist.id))
-        .paletteSelection(model.selection == .playlist(playlist.id))
+        .paletteSelection(model.selection == .playlist(playlist.id), isDropTarget: drop != nil)
         .contextMenu { contextMenu(for: playlist) }
         .draggable("playlist:\(playlist.id)")
-        .onDrop(of: [.fileURL, .plainText], isTargeted: nil) { providers in
-            handleDrop(providers, onto: playlist)
-        }
+        .onDrop(of: [.fileURL, .plainText], delegate: PlaylistDropDelegate(
+            playlist: playlist,
+            setTarget: { drop in
+                if let drop {
+                    dropTarget = (playlist.id, drop)
+                } else if dropTarget?.id == playlist.id {
+                    dropTarget = nil
+                }
+            },
+            perform: { providers in handleDrop(providers, onto: playlist) }))
     }
 
     @ViewBuilder
@@ -179,7 +198,7 @@ struct SidebarView: View {
 
     /// Tracks (as file URLs from the track list or Finder) are added to regular playlists, all in
     /// one step and in the order they were dragged; playlists ("playlist:<id>" text) dropped on a
-    /// folder move into it.
+    /// folder move into it (or next to another playlist).
     private func handleDrop(_ providers: [NSItemProvider], onto target: Playlist) -> Bool {
         let fileProviders = target.kind == .regular
             ? providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) } : []
@@ -213,5 +232,59 @@ struct SidebarView: View {
             }
         }
         return handled
+    }
+}
+
+/// What a drag would do if dropped on a playlist row.
+enum PlaylistDrop: Equatable {
+    /// Tracks (file URLs) go into a regular playlist.
+    case addTracks
+    /// A dragged playlist moves into this folder, or next to this playlist.
+    case movePlaylist
+
+    /// What dropping `hasFiles` file URLs and/or `hasPlaylist` a dragged playlist on a playlist
+    /// of `kind` would do; nil when the row can't take it (files on a smart playlist or a folder),
+    /// so the drag shows it isn't allowed there and nothing lights up.
+    static func of(kind: Playlist.Kind, hasFiles: Bool, hasPlaylist: Bool) -> PlaylistDrop? {
+        if hasPlaylist { return .movePlaylist }
+        if hasFiles, kind == .regular { return .addTracks }
+        return nil
+    }
+}
+
+/// Lights a playlist row up while something it can take is dragged over it, and hands the drop on.
+private struct PlaylistDropDelegate: DropDelegate {
+    let playlist: Playlist
+    /// Called with what a drop would do while the drag is over the row, and with nil once it leaves.
+    let setTarget: (PlaylistDrop?) -> Void
+    let perform: ([NSItemProvider]) -> Bool
+
+    private func drop(for info: DropInfo) -> PlaylistDrop? {
+        PlaylistDrop.of(kind: playlist.kind,
+                        hasFiles: info.hasItemsConforming(to: [.fileURL]),
+                        hasPlaylist: info.hasItemsConforming(to: [.plainText]))
+    }
+
+    func validateDrop(info: DropInfo) -> Bool { drop(for: info) != nil }
+
+    func dropEntered(info: DropInfo) {
+        setTarget(drop(for: info))
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        switch drop(for: info) {
+        case .addTracks?: DropProposal(operation: .copy)
+        case .movePlaylist?: DropProposal(operation: .move)
+        case nil: DropProposal(operation: .forbidden)
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        setTarget(nil)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        setTarget(nil)
+        return perform(info.itemProviders(for: [.fileURL, .plainText]))
     }
 }
