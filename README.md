@@ -139,8 +139,9 @@ xattr -dr com.apple.quarantine /Applications/susurrus.app
   which shows on the panes it filters (tracks, albums, artists, browser).
 - Ratings: click stars in the table, Track ▸ Rating, or ⌘0–⌘5.
 - Playlists: new (⌘N, with the name ready to type), from selection (⇧⌘N), folders, rename, delete, drag tracks onto a
-  playlist, drag playlists into folders, reorder by dragging rows (in playlist order),
-  remove (⌘⌫).
+  playlist (the row lights up with a + while they're over it; smart playlists and folders don't
+  take tracks, and say so), drag playlists into folders, reorder by dragging rows (in playlist
+  order), remove (⌘⌫).
 - **Smart playlists** (⌥⌘N): native rule editor with a live match count.
 - **Undo/Redo** (⌘Z/⇧⌘Z) for Get Info edits, ratings, and every playlist change: add, remove,
   reorder, rename, move, create, edit smart rules, and delete (a deleted folder comes back with
