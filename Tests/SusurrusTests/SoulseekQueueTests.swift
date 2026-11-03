@@ -375,10 +375,14 @@ import Testing
 
         let next = makeModel(mock)
         next.restoreDownloads(from: file)
-        #expect(next.downloads.map(\.fileName) == ["01 Song.flac", "failed.flac"], "finished and cancelled ones aren't kept")
+        #expect(next.downloads.map(\.fileName) == ["01 Song.flac", "failed.flac", "finished.flac", "cancelled.flac"], "all kept, in order")
         #expect(next.downloads[0].id == wanted.id && next.downloads[0].partURL == wanted.partURL && next.downloads[0].localURL == wanted.localURL)
         #expect(next.downloads[0].state == .waitingForConnection)
         #expect(next.downloads[1].state == .failed("File not shared."))
+        #expect(next.downloads[2].state == .finished(folder.appendingPathComponent("finished.flac")))
+        #expect(next.downloads[3].state == .cancelled)
+        #expect(next.downloads.allSatisfy { $0.added != nil }, "when each was queued")
+        #expect(next.downloads[0].ended == nil && next.downloads[1...].allSatisfy { $0.ended != nil }, "when each ended")
         #expect(next.activeDownloadCount == 1 && next.resumesDownloadsAtLaunch)
 
         let before = mock.queueUploadCount
@@ -386,6 +390,143 @@ import Testing
         defer { next.disconnect() }
         try await waitUntil { next.downloads[0].state == .requested && mock.queueUploadCount > before }
         #expect(next.downloads[1].state == .failed("File not shared."), "that one waits for Retry")
+    }
+
+    private func savedRow(_ name: String, outcome: SoulseekSavedQueue.Download.Outcome?, destination: URL? = nil,
+                          part: URL? = nil, ended: Date? = nil) -> SoulseekSavedQueue.Download {
+        SoulseekSavedQueue.Download(
+            id: UUID(), username: "someuploader", remotePath: "@@x\\Album\\\(name)", size: 40_000,
+            partPath: (part ?? folder.appendingPathComponent(".incomplete/\(name).part")).path,
+            destinationPath: (destination ?? folder.appendingPathComponent("Album/\(name)")).path,
+            failure: outcome == .failed ? "File not shared." : nil, outcome: outcome,
+            added: Date().addingTimeInterval(-7200), ended: ended ?? (outcome == nil ? nil : Date().addingTimeInterval(-3600)))
+    }
+
+    private func write(_ queue: SoulseekSavedQueue, to file: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try encoder.encode(queue).write(to: file)
+    }
+
+    @Test func historyIsKeptUpToALimitOldestFirst() async throws {
+        defer { forgetSettings() }
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let file = folder.appendingPathComponent("Downloads.json")
+        var queue = SoulseekSavedQueue()
+        for n in 0 ..< (SoulseekModel.keptDownloadsLimit + 200) {
+            queue.downloads.append(savedRow("\(n).flac", outcome: n % 3 == 0 ? .cancelled : .finished))
+        }
+        queue.downloads.insert(savedRow("wanted.flac", outcome: nil), at: 100)
+        try write(queue, to: file)
+
+        let model = makeModel(mock)
+        model.restoreDownloads(from: file)
+        #expect(model.downloads.count == SoulseekModel.keptDownloadsLimit + 1)
+        #expect(model.downloads.first?.fileName == "wanted.flac", "what's still wanted is never dropped")
+        #expect(model.downloads[1].fileName == "200.flac", "the oldest history went")
+        #expect(model.activeDownloadCount == 1)
+        model.finishSavingQueue()
+        #expect(SoulseekQueueFile(url: file).load().downloads.count == SoulseekModel.keptDownloadsLimit + 1)
+    }
+
+    @Test func whereTheFilesAreIsLookedUpAtLaunch() async throws {
+        defer { forgetSettings() }
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let file = folder.appendingPathComponent("Downloads.json")
+        // The library folder is somewhere else than the download folder, as it is for real.
+        let library = FileManager.default.temporaryDirectory.appendingPathComponent("SoulseekQueueTests-Library-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: library) }
+        for url in [folder.appendingPathComponent("Album/here.flac"), library.appendingPathComponent("Artist/Album/moved.flac")] {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(repeating: 1, count: 10).write(to: url)
+        }
+        let part = folder.appendingPathComponent(".incomplete/partial.flac.part")
+        try FileManager.default.createDirectory(at: part.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(repeating: 2, count: 1234).write(to: part)
+        let queue = SoulseekSavedQueue(downloads: [
+            savedRow("here.flac", outcome: .finished),
+            savedRow("moved.flac", outcome: .finished, destination: library.appendingPathComponent("Artist/Album/moved.flac")),
+            savedRow("gone.flac", outcome: .finished),
+            savedRow("away.flac", outcome: .finished, destination: URL(fileURLWithPath: "/Volumes/NoSuchVolume-\(UUID().uuidString)/Artist/Album/away.flac")),
+            savedRow("partial.flac", outcome: nil, part: part),
+            savedRow("failed.flac", outcome: .failed),
+        ])
+        try write(queue, to: file)
+
+        let model = makeModel(mock)
+        model.restoreDownloads(from: file)
+        try await waitUntil { model.downloads.filter(\.isFinished).allSatisfy { $0.whereabouts != nil } }
+        func place(_ name: String) -> SoulseekDownload.Whereabouts? { model.downloads.first { $0.fileName == name }?.whereabouts }
+        #expect(place("here.flac") == .downloads)
+        #expect(place("moved.flac") == .library(volume: nil))
+        #expect(place("gone.flac") == .missing)
+        if case .offline(let volume)? = place("away.flac") {
+            #expect(volume.hasPrefix("NoSuchVolume-"))
+        } else {
+            Issue.record("expected offline, got \(String(describing: place("away.flac")))")
+        }
+        #expect(place("failed.flac") == nil, "only finished files are looked for")
+        try await waitUntil { model.downloads.first { $0.fileName == "partial.flac" }?.onDisk == 1234 }
+        #expect(model.downloads.first { $0.fileName == "partial.flac" }?.state == .waitingForConnection)
+
+        // By folder, each folder says where its files are when they agree.
+        model.downloadSort = .folder
+        let albumFolder = model.downloadFolders.first { $0.url == folder.appendingPathComponent("Album", isDirectory: true) }
+        #expect(albumFolder?.whereabouts == nil, "here.flac and gone.flac are in different places")
+        let movedFolder = model.downloadFolders.first { $0.url == library.appendingPathComponent("Artist/Album", isDirectory: true) }
+        #expect(movedFolder?.whereabouts == .library(volume: nil))
+    }
+
+    @Test func aMovedDownloadKnowsItsNewPlaceAtOnce() async throws {
+        defer { forgetSettings() }
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let file = folder.appendingPathComponent("Downloads.json")
+        try write(SoulseekSavedQueue(downloads: [savedRow("a.flac", outcome: .finished)]), to: file)
+        let model = makeModel(mock)
+        model.restoreDownloads(from: file)
+        let old = try #require(model.downloads.first)
+        let volume = "/Volumes/Music-\(UUID().uuidString)"
+        model.noteMoved([old.localURL.path: URL(fileURLWithPath: volume + "/Artist/Album/01 A.flac")])
+        let moved = try #require(model.downloads.first)
+        #expect(moved.localURL.path == volume + "/Artist/Album/01 A.flac")
+        #expect(moved.whereabouts == .library(volume: (volume as NSString).lastPathComponent))
+        model.finishSavingQueue()
+        #expect(SoulseekQueueFile(url: file).load().downloads.first?.destinationPath == moved.localURL.path, "the move is remembered")
+    }
+
+    @Test func aFinishedDownloadIsDatedAndPlaced() async throws {
+        defer { forgetSettings() }
+        let mock = try await MockSoulseekServer()
+        defer { mock.stop() }
+        let model = makeModel(mock)
+        defer { model.disconnect() }
+        model.download([result(size: 1000)])
+        try await waitUntil { state(of: model) == .requested }
+        let row = try #require(model.downloads.first)
+        #expect(row.added != nil && row.ended == nil)
+        let landed = folder.appendingPathComponent("Album/01 Song.flac")
+        model.applyDownloadState(row.id, .finished(landed), from: try #require(row.session))
+        let done = try #require(model.downloads.first)
+        #expect(done.ended != nil && done.whereabouts == .downloads)
+    }
+
+    @Test func aQueueFileFromBeforeHistoryStillReads() throws {
+        defer { forgetSettings() }
+        let file = folder.appendingPathComponent("Downloads.json")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("""
+        {"downloads":[{"id":"8F0C7D4E-1111-4A5B-9C3D-000000000001","username":"u","remotePath":"@@x\\\\A\\\\wanted.flac","size":5,
+        "partPath":"/tmp/x.part","destinationPath":"/tmp/A/wanted.flac"},
+        {"id":"8F0C7D4E-1111-4A5B-9C3D-000000000002","username":"u","remotePath":"@@x\\\\A\\\\failed.flac","size":5,
+        "partPath":"/tmp/y.part","destinationPath":"/tmp/A/failed.flac","failure":"File not shared."}],"imports":[]}
+        """.utf8).write(to: file)
+        let saved = SoulseekQueueFile(url: file).load()
+        #expect(saved.downloads.map(\.outcome) == [nil, nil] && saved.downloads.map(\.failure) == [nil, "File not shared."])
+        #expect(saved.downloads.allSatisfy { $0.added == nil && $0.ended == nil })
     }
 
     @Test func theFileGoesWhenThereIsNothingLeftToKeep() async throws {
@@ -400,6 +541,10 @@ import Testing
         model.finishSavingQueue()
         #expect(FileManager.default.fileExists(atPath: file.path))
         model.cancel(model.downloads.map(\.id))
+        model.finishSavingQueue()
+        #expect(FileManager.default.fileExists(atPath: file.path), "a cancelled download is history")
+        #expect(SoulseekQueueFile(url: file).load().downloads.first?.outcome == .cancelled)
+        model.clearInactiveDownloads()
         model.finishSavingQueue()
         #expect(!FileManager.default.fileExists(atPath: file.path))
     }

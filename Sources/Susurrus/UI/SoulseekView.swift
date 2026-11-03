@@ -11,6 +11,7 @@ struct SoulseekView: View {
     @State private var selectedWishlistQuery: String?
     @State private var newWishlistQuery = ""
     @State private var newConversationUser = ""
+    @State private var isConfirmingMoveAll = false
 
     private var soulseek: SoulseekModel { model.soulseek }
     private var pane: Pane { soulseek.pane }
@@ -120,6 +121,14 @@ struct SoulseekView: View {
                     .disabled(soulseek.activeDownloadCount == 0)
                 Button("Clear Finished") { soulseek.clearInactiveDownloads() }
                     .disabled(!soulseek.hasInactiveDownloads)
+                Button("Move All to Library…") { isConfirmingMoveAll = true }
+                    .disabled(model.libraryFolder == nil)
+                    .help("Files every album in the download folder in the library folder")
+                    .confirmationDialog("Move every album in the download folder to the library?", isPresented: $isConfirmingMoveAll) {
+                        Button("Move All") { model.moveAllDownloadsToLibrary() }
+                    } message: {
+                        Text("Albums still downloading wait. Each of the rest is matched on MusicBrainz, or filed by its own tags, copied into Artist/Album in the library folder, and deleted here once its copy is checked. Albums the library doesn't know yet are added first.")
+                    }
             }
             Spacer()
             statusLabel
@@ -286,29 +295,75 @@ struct SoulseekView: View {
 
 // MARK: - Downloads tab
 
-/// Downloads (newest first or by folder) and uploads. Rows take the download itself and look up
-/// actions through the model, so a progress update redraws only its own row.
+/// Downloads (newest first or by folder), album folders still in the download folder that the
+/// list doesn't remember, and uploads. Rows take the download itself and look up actions through
+/// the model, so a progress update redraws only its own row.
 private struct TransfersList: View {
     @Environment(AppModel.self) private var model
+    /// Album folders on disk that no row in the list accounts for.
+    @State private var albumsOnDisk: [AppModel.DownloadedAlbumOnDisk] = []
 
     private var soulseek: SoulseekModel { model.soulseek }
 
     var body: some View {
-        if soulseek.downloads.isEmpty, soulseek.uploads.isEmpty {
-            ContentUnavailableView(
-                "No Transfers",
-                systemImage: "arrow.up.arrow.down",
-                description: Text("Files you download — and files other users fetch from your shared folder — show up here.")
-            )
-        } else {
+        Group {
+            if soulseek.downloads.isEmpty, soulseek.uploads.isEmpty, albumsOnDisk.isEmpty {
+                ContentUnavailableView(
+                    "No Transfers",
+                    systemImage: "arrow.up.arrow.down",
+                    description: Text("Files you download — and files other users fetch from your shared folder — show up here.")
+                )
+            } else {
+                list
+            }
+        }
+        .task(id: "\(model.libraryRevision)-\(model.tracks.count)-\(soulseek.downloadFolders.count)-\(model.queuedAlbumMoves.count)") {
+            await findAlbumsOnDisk()
+        }
+    }
+
+    /// Album folders on disk under the download folder, minus those the list shows.
+    private func findAlbumsOnDisk() async {
+        let listed = Set(soulseek.downloadFolders.map { model.downloadAlbumFolder(for: $0.url).standardizedFileURL })
+        let found = await model.albumFoldersOnDisk().filter { !listed.contains($0.url) }
+        guard !Task.isCancelled else { return }
+        if found != albumsOnDisk { albumsOnDisk = found }
+    }
+
+    /// "3 active · 61 in the download folder · 120 moved to the library", for the section header.
+    private var summary: String {
+        var here = 0, moved = 0, gone = 0
+        for download in soulseek.downloads where download.isFinished {
+            switch download.whereabouts {
+            case .downloads?: here += 1
+            case .library?, .offline?: moved += 1
+            case .missing?: gone += 1
+            case nil: break
+            }
+        }
+        var parts: [String] = []
+        if soulseek.activeDownloadCount > 0 { parts.append("\(soulseek.activeDownloadCount.formatted()) active") }
+        if here > 0 { parts.append("\(here.formatted()) in the download folder") }
+        if moved > 0 { parts.append("\(moved.formatted()) moved to the library") }
+        if gone > 0 { parts.append("\(gone.formatted()) gone") }
+        return parts.joined(separator: " · ")
+    }
+
+    private var list: some View {
             List {
                 if !soulseek.downloads.isEmpty {
                     switch soulseek.downloadSort {
                     case .newestFirst:
-                        Section("Downloads") {
+                        Section {
                             ForEach(soulseek.downloads.reversed()) { download in
                                 DownloadRow(download: download).equatable()
                             }
+                        } header: {
+                            HStack {
+                                Text("Downloads")
+                                Text(summary).foregroundStyle(.secondary)
+                            }
+                            .lineLimit(1)
                         }
                     case .folder:
                         ForEach(soulseek.downloadFolders) { folder in
@@ -322,6 +377,17 @@ private struct TransfersList: View {
                                 DownloadFolderHeader(folder: folder).equatable()
                             }
                         }
+                    }
+                }
+                if !albumsOnDisk.isEmpty {
+                    Section {
+                        ForEach(albumsOnDisk) { album in
+                            AlbumOnDiskRow(album: album).equatable()
+                        }
+                    } header: {
+                        Text(soulseek.downloads.isEmpty ? "In the download folder" : "Also in the download folder")
+                    } footer: {
+                        Text("Albums in the download folder that haven't moved to the library folder, downloaded by susurrus or not.")
                     }
                 }
                 if !soulseek.uploads.isEmpty {
@@ -355,8 +421,73 @@ private struct TransfersList: View {
             } message: { _ in
                 Text("What has arrived so far is deleted.")
             }
+    }
+}
+
+/// An album folder in the download folder that the downloads list doesn't show: a download from
+/// before the list was kept, one cleared from it, or one another app put there.
+private struct AlbumOnDiskRow: View, Equatable {
+    @Environment(AppModel.self) private var model
+    let album: AppModel.DownloadedAlbumOnDisk
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.album == rhs.album }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder")
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(album.name)
+                    .lineLimit(1)
+                    .help(album.url.path)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if model.preparingAlbumMoves.contains(album.url.path) {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
+        .contextMenu {
+            Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([album.url]) }
+            if !album.isInLibrary {
+                Button("Add to Library") { model.addToLibrary([album.url]) }
+            }
+            Button("Look Up Album on MusicBrainz…") { model.lookUpDownload(folder: album.url) }
+                .disabled(!album.isInLibrary)
+            Button("Move to Library") { model.moveDownloadToLibrary(folder: album.url) }
+                .disabled(!model.canMoveDownloadToLibrary(folder: album.url))
         }
     }
+
+    private var detail: String {
+        let files = "\(album.audioFiles.formatted()) \(album.audioFiles == 1 ? "file" : "files")"
+        if model.preparingAlbumMoves.contains(album.url.path) { return files + " · looking it up…" }
+        if !album.isInLibrary { return files + " · not in the library yet" }
+        if album.trackCount < album.audioFiles { return files + " · \(album.trackCount.formatted()) in the library" }
+        return files + " · in the library"
+    }
+}
+
+/// Where a finished download's file is, for a status line.
+private func placeText(_ place: SoulseekDownload.Whereabouts) -> String {
+    switch place {
+    case .downloads: "in the download folder"
+    case .library(let volume?): "moved to the library on \(volume)"
+    case .library(nil): "moved to the library"
+    case .missing: "the file isn't there any more"
+    case .offline(let volume): "moved to the library on \(volume), which isn't mounted"
+    }
+}
+
+/// "just now", "2 hours ago", "yesterday", for when a download ended.
+private func whenText(_ date: Date) -> String {
+    if Date().timeIntervalSince(date) < 60 { return "just now" }
+    return date.formatted(.relative(presentation: .named))
 }
 
 /// Section header for one folder when downloads are grouped: name, who it's from, and how far along.
@@ -388,7 +519,9 @@ private struct DownloadFolderHeader: View, Equatable {
     private var summary: String {
         let total = folder.downloadIDs.count
         let done = folder.finishedCount
-        return done == total ? "\(total) \(total == 1 ? "file" : "files")" : "\(done) of \(total) done"
+        let progress = done == total ? "\(total) \(total == 1 ? "file" : "files")" : "\(done) of \(total) done"
+        guard done > 0, let place = folder.whereabouts else { return progress }
+        return progress + " · " + placeText(place)
     }
 }
 
@@ -422,13 +555,14 @@ private struct DownloadRow: View, Equatable {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .help(statusText + (retryNote ?? ""))
+                .help(statusHelp)
             }
             Spacer()
-            if case .transferring(let received, let total) = download.state {
-                ProgressView(value: Double(received), total: Double(max(total, 1)))
+            if let progress {
+                ProgressView(value: Double(progress.done), total: Double(max(progress.total, 1)))
                     .progressViewStyle(.linear)
                     .frame(width: 140)
+                    .help(download.isActive && !isTransferring ? "What's arrived so far; it carries on from there" : "")
             }
             if download.isActive {
                 Button {
@@ -462,6 +596,7 @@ private struct DownloadRow: View, Equatable {
             Button("Show in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
             }
+            .disabled(download.whereabouts == .missing || { if case .offline? = download.whereabouts { true } else { false } }())
             Button("Look Up Album on MusicBrainz…") { model.lookUpDownload(folder: url.deletingLastPathComponent()) }
                 .disabled(model.track(atPath: url.path) == nil)
             Button("Move to Library") { model.moveDownloadToLibrary(folder: url.deletingLastPathComponent()) }
@@ -486,19 +621,49 @@ private struct DownloadRow: View, Equatable {
         }
     }
 
+    private var isTransferring: Bool {
+        if case .transferring = download.state { true } else { false }
+    }
+
+    /// The bar: the transfer under way, or what an unfinished download has on disk so far.
+    private var progress: (done: UInt64, total: UInt64)? {
+        if case .transferring(let received, let total) = download.state { return (received, total) }
+        if download.isActive, download.onDisk > 0 { return (download.onDisk, download.size) }
+        return nil
+    }
+
     private var statusText: String {
+        let ended = download.ended.map(whenText)
         switch download.state {
-        case .waitingForConnection: "Carries on once connected"
-        case .connecting: "Connecting…"
-        case .requested: "Waiting for the uploader…"
-        case .queued(let place):
-            place.map { "In queue (position \($0.formatted()))" } ?? "In queue"
+        case .waitingForConnection, .connecting, .requested, .queued, .interrupted:
+            let soFar = download.onDisk > 0 ? "\(byteCount(download.onDisk)) of \(byteCount(download.size)) so far · " : ""
+            switch download.state {
+            case .waitingForConnection: return soFar + "Carries on once connected"
+            case .connecting: return soFar + "Connecting…"
+            case .requested: return soFar + "Waiting for the uploader…"
+            case .queued(let place): return soFar + (place.map { "In queue (position \($0.formatted()))" } ?? "In queue")
+            case .interrupted(let reason): return soFar + reason
+            default: return soFar
+            }
         case .transferring(let received, let total):
-            "\(byteCount(received)) of \(byteCount(total))"
-        case .finished: "Done — added to the library"
-        case .interrupted(let reason), .failed(let reason): reason
-        case .cancelled: "Cancelled"
+            return "\(byteCount(received)) of \(byteCount(total))"
+        case .finished:
+            var text = "Done"
+            if let ended { text += " " + ended }
+            if let place = download.whereabouts { text += " — " + placeText(place) }
+            return text
+        case .failed(let reason):
+            return ended.map { "\(reason) · \($0)" } ?? reason
+        case .cancelled:
+            return ended.map { "Cancelled \($0)" } ?? "Cancelled"
         }
+    }
+
+    /// The status line in full, with the file's path once it has one.
+    private var statusHelp: String {
+        var help = statusText + (retryNote ?? "")
+        if download.isFinished { help += "\n" + download.localURL.path }
+        return help
     }
 
     /// When an interrupted download carries on.

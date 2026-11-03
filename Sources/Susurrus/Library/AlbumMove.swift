@@ -61,7 +61,18 @@ enum TagFiling {
         return folder + "/" + ReleaseMatcher.safeName(album.isEmpty ? "Unknown Album" : album)
     }
 
-    static func plan(for inputs: [ReleaseMatcher.Input], isCompilation: Bool, folderName: String) -> Outcome {
+    /// `pathInferred`: what an untagged file in this folder gets as its artist and album from its
+    /// path alone (the download folder's name, and the folder's). An input that says exactly that
+    /// is taken as untagged, so the folder name decides instead of "Soulseek/Artist - Album".
+    static func plan(for inputs: [ReleaseMatcher.Input], isCompilation: Bool, folderName: String,
+                     pathInferred: (artist: String, album: String)? = nil) -> Outcome {
+        let inputs = inputs.map { input -> ReleaseMatcher.Input in
+            guard let pathInferred, input.artist == pathInferred.artist, input.album == pathInferred.album else { return input }
+            var untagged = input
+            untagged.artist = ""
+            untagged.album = ""
+            return untagged
+        }
         func commonest(_ values: [String]) -> String {
             let counts = Dictionary(values.filter { !$0.isEmpty }.map { ($0, 1) }, uniquingKeysWith: +)
             return counts.max { ($0.value, $1.key) < ($1.value, $0.key) }?.key ?? ""
@@ -132,6 +143,27 @@ enum AlbumMoveFiles {
     static func isFolder(_ url: URL) -> Bool {
         var isDirectory: ObjCBool = false
         return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    /// The album folders in the download folder: its top-level folders that hold audio, however
+    /// deep (disc folders), each with how many audio files, by name. Hidden folders
+    /// (`.incomplete`) are passed over. Blocking: for `BlockingIO`.
+    static func albumFolders(in root: URL) -> [(url: URL, audioFiles: Int)] {
+        let fileManager = FileManager.default
+        guard let names = try? fileManager.contentsOfDirectory(atPath: root.path) else { return [] }
+        var found: [(url: URL, audioFiles: Int)] = []
+        for name in names where !name.hasPrefix(".") {
+            let url = root.appendingPathComponent(name, isDirectory: true)
+            guard isFolder(url),
+                  let files = fileManager.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey],
+                                                     options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
+            var count = 0
+            while let file = files.nextObject() as? URL {
+                if TagReader.isAudioFile(file) { count += 1 }
+            }
+            if count > 0 { found.append((url.standardizedFileURL, count)) }
+        }
+        return found.sorted { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }
     }
 
     /// Copies the tracks (as `name`) and the rest of the album folder (covers, cue sheets, logs,

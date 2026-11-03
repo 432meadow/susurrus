@@ -24,6 +24,26 @@ struct SoulseekDownload: Identifiable, Equatable {
     var retryDate: Date?
     /// The client that has it, whose reports count for it.
     var session: Int?
+    /// When it was queued; nil for one from before this was noted.
+    var added: Date?
+    /// When it finished, failed or was cancelled.
+    var ended: Date?
+    /// Where a finished download's file is, as last looked (`refreshWhereabouts`).
+    var whereabouts: Whereabouts?
+    /// How much of an unfinished download sits in its part file, as last looked.
+    var onDisk: UInt64 = 0
+
+    /// Where a finished download's file is now.
+    enum Whereabouts: Hashable, Sendable {
+        /// Still in the download folder, on this Mac.
+        case downloads
+        /// Moved to the library folder: on the volume named, or on this Mac.
+        case library(volume: String?)
+        /// Not where it was left.
+        case missing
+        /// Moved to the library folder on a volume that isn't mounted.
+        case offline(volume: String)
+    }
 
     var fileName: String { localURL.lastPathComponent }
     var isActive: Bool {
@@ -38,18 +58,29 @@ struct SoulseekDownload: Identifiable, Equatable {
     }
 }
 
-/// The downloads still wanted, and the finished folders not yet imported, as saved: they carry on
-/// after a quit. Finished downloads aren't kept: their files are in the library by then.
+/// The downloads list as saved: what's still wanted carries on after a quit, and what's over
+/// stays as history (up to `SoulseekModel.keptDownloadsLimit`), along with the finished folders
+/// not yet imported.
 struct SoulseekSavedQueue: Codable, Equatable {
     struct Download: Codable, Equatable {
+        enum Outcome: String, Codable {
+            case finished, failed, cancelled
+        }
+
         var id: UUID
         var username: String
         var remotePath: String
         var size: UInt64
         var partPath: String
+        /// Where the file lands, or landed; it follows the file when an album moves to the library.
         var destinationPath: String
-        /// Why it stopped for good; nil while it's still wanted.
+        /// Why it failed; nil otherwise.
         var failure: String?
+        /// How it ended; nil while it's still wanted. (Files from before this was saved have
+        /// `failure` alone for a failed one.)
+        var outcome: Outcome?
+        var added: Date?
+        var ended: Date?
     }
 
     var downloads: [Download] = []
@@ -71,7 +102,9 @@ final class SoulseekQueueFile: @unchecked Sendable {
 
     func load() -> SoulseekSavedQueue {
         guard let data = try? Data(contentsOf: url) else { return SoulseekSavedQueue() }
-        return (try? JSONDecoder().decode(SoulseekSavedQueue.self, from: data)) ?? SoulseekSavedQueue()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode(SoulseekSavedQueue.self, from: data)) ?? SoulseekSavedQueue()
     }
 
     func save(_ saved: SoulseekSavedQueue) {
@@ -98,7 +131,9 @@ final class SoulseekQueueFile: @unchecked Sendable {
                 if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
             } else {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try JSONEncoder().encode(saved).write(to: url, options: .atomic)
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                try encoder.encode(saved).write(to: url, options: .atomic)
             }
         } catch {
             EventLog.shared.log("Couldn't save the Soulseek downloads: \(error.localizedDescription)")
@@ -167,7 +202,9 @@ final class SoulseekModel {
         case search, wishlist, browse, messages, downloads
     }
 
-    var pane: Pane = .search
+    var pane: Pane = .search {
+        didSet { if pane == .downloads { refreshWhereabouts() } }
+    }
 
     // MARK: Account
 
@@ -1129,9 +1166,14 @@ final class SoulseekModel {
         if case .finished(let url) = newState {
             downloads[index].localURL = url
             downloads[index].retryDate = nil
+            downloads[index].whereabouts = .downloads  // it was just moved into place there
             scheduleImport(of: url.deletingLastPathComponent())
         }
         let now = downloads[index]
+        if was.isActive, !now.isActive {
+            downloads[index].ended = Date()
+            downloads[index].onDisk = 0
+        }
         if now.isActive != was.isActive || now.isFinished != was.isFinished || now.localURL != was.localURL {
             downloadsChanged()
         }
@@ -1321,8 +1363,10 @@ final class SoulseekModel {
         // A new ID: the client remembers cancels of IDs it hasn't seen.
         let id = UUID()
         if !isUnderWay {
-            downloads.append(SoulseekDownload(id: id, username: item.username, remotePath: item.remotePath, size: item.size,
-                                              partURL: item.partURL, localURL: item.localURL))
+            var row = SoulseekDownload(id: id, username: item.username, remotePath: item.remotePath, size: item.size,
+                                       partURL: item.partURL, localURL: item.localURL)
+            row.added = item.added ?? Date()
+            downloads.append(row)
         }
         downloadsChanged()
         connect()
@@ -1350,6 +1394,8 @@ final class SoulseekModel {
             }
             downloads[index].state = .cancelled
             downloads[index].retryDate = nil
+            downloads[index].ended = Date()
+            downloads[index].onDisk = 0
             pendingDownloadProgress[id] = nil
             changed = true
             if isWithClient, let client {
@@ -1416,14 +1462,27 @@ final class SoulseekModel {
         var users: [String]
         var activeCount: Int
         var finishedCount: Int
+        /// Where the finished files are, when they're all in one place.
+        var whereabouts: SoulseekDownload.Whereabouts?
 
         var id: URL { url }
         var name: String { url.lastPathComponent }
     }
 
+    /// How many finished, failed and cancelled downloads are kept as history; the oldest go first.
+    static let keptDownloadsLimit = 1000
+
     /// Rebuilds what's derived from the downloads list: lookup by ID, folders, the active count.
     /// Needed when downloads come, go, end or move — not for progress.
     private func downloadsChanged() {
+        var over = downloads.lazy.filter { !$0.isActive }.count - Self.keptDownloadsLimit
+        if over > 0 {
+            downloads.removeAll { row in
+                guard over > 0, !row.isActive else { return false }
+                over -= 1
+                return true
+            }
+        }
         downloadIndex = Dictionary(uniqueKeysWithValues: downloads.enumerated().map { ($1.id, $0) })
         let active = downloads.lazy.filter(\.isActive).count
         if active != activeDownloadCount { activeDownloadCount = active }
@@ -1431,12 +1490,14 @@ final class SoulseekModel {
             .map { url, items -> DownloadFolder in
                 let sorted = items.sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }
                 var seen = Set<String>()
+                let places = Set(items.compactMap { $0.isFinished ? $0.whereabouts : nil })
                 return DownloadFolder(
                     url: url,
                     downloadIDs: sorted.map(\.id),
                     users: sorted.map(\.username).filter { seen.insert($0).inserted },
                     activeCount: items.lazy.filter(\.isActive).count,
-                    finishedCount: items.lazy.filter(\.isFinished).count)
+                    finishedCount: items.lazy.filter(\.isFinished).count,
+                    whereabouts: places.count == 1 ? places.first : nil)
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         if folders != downloadFolders { downloadFolders = folders }
@@ -1446,7 +1507,8 @@ final class SoulseekModel {
     // MARK: Keeping downloads going
 
     /// Picks up what the last run saved, from the queue at `url`, which is kept there from now
-    /// on. Unfinished downloads wait to be asked for once connected.
+    /// on. Unfinished downloads wait to be asked for once connected; finished ones are history,
+    /// and where their files are now is looked up in the background.
     func restoreDownloads(from url: URL) {
         let file = SoulseekQueueFile(url: url)
         queueFile = file
@@ -1455,14 +1517,121 @@ final class SoulseekModel {
         }
         let saved = file.load()
         downloads = saved.downloads.map { saved in
-            SoulseekDownload(
+            let state: SlskDownloadState
+            switch saved.outcome {
+            case .finished?: state = .finished(URL(fileURLWithPath: saved.destinationPath))
+            case .cancelled?: state = .cancelled
+            case .failed?: state = .failed(saved.failure ?? "Failed")
+            case nil: state = saved.failure.map { .failed($0) } ?? .waitingForConnection
+            }
+            var row = SoulseekDownload(
                 id: saved.id, username: saved.username, remotePath: saved.remotePath, size: saved.size,
                 partURL: URL(fileURLWithPath: saved.partPath), localURL: URL(fileURLWithPath: saved.destinationPath),
-                state: saved.failure.map { .failed($0) } ?? .waitingForConnection)
+                state: state)
+            row.added = saved.added
+            row.ended = saved.ended
+            return row
         }
         pendingImportFolders = Set(saved.imports.map { URL(fileURLWithPath: $0, isDirectory: true) })
         downloadsChanged()
         if !pendingImportFolders.isEmpty { scheduleImport() }
+        // The library folder is usually a share: what's there changes as it comes and goes.
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshWhereabouts(force: true) }
+            }
+        }
+        refreshWhereabouts(force: true)
+    }
+
+    // MARK: Where the files are
+
+    @ObservationIgnored private var whereaboutsTask: Task<Void, Never>?
+    @ObservationIgnored private var whereaboutsLookedAt: Date?
+    @ObservationIgnored private var whereaboutsAgain = false
+
+    /// Looks, in the background, where each finished download's file is now and how much of each
+    /// unfinished one is on disk. Each folder is listed once, since the library folder is usually
+    /// on a share. Not more than every 30 s unless `force`.
+    func refreshWhereabouts(force: Bool = false) {
+        guard !downloads.isEmpty else { return }
+        if whereaboutsTask != nil {
+            whereaboutsAgain = whereaboutsAgain || force
+            return
+        }
+        if !force, let last = whereaboutsLookedAt, Date().timeIntervalSince(last) < 30 { return }
+        whereaboutsLookedAt = Date()
+        let rows = downloads.map {
+            WhereaboutsQuery(id: $0.id, path: $0.localURL.path, partPath: $0.partURL.path, isFinished: $0.isFinished, isActive: $0.isActive)
+        }
+        let downloadFolder = downloadFolderPath
+        whereaboutsTask = Task { [weak self] in
+            let found = await Self.lookUpWhereabouts(rows, downloadFolder: downloadFolder)
+            guard let self else { return }
+            self.whereaboutsTask = nil
+            var changed = false
+            for (id, place) in found.places {
+                guard let index = self.downloadIndex[id], index < self.downloads.count, self.downloads[index].id == id,
+                      self.downloads[index].isFinished, self.downloads[index].whereabouts != place else { continue }
+                self.downloads[index].whereabouts = place
+                changed = true
+            }
+            for (id, bytes) in found.onDisk {
+                guard let index = self.downloadIndex[id], index < self.downloads.count, self.downloads[index].id == id,
+                      self.downloads[index].isActive, self.downloads[index].onDisk != bytes else { continue }
+                self.downloads[index].onDisk = bytes
+            }
+            if changed { self.downloadsChanged() }  // the folders' summaries follow
+            if self.whereaboutsAgain {
+                self.whereaboutsAgain = false
+                self.refreshWhereabouts(force: true)
+            }
+        }
+    }
+
+    private struct WhereaboutsQuery: Sendable {
+        let id: UUID
+        let path: String
+        let partPath: String
+        let isFinished: Bool
+        let isActive: Bool
+    }
+
+    /// Where a finished download's file is, going by its path: in the download folder, or moved
+    /// to the library (on the volume named, if it's under /Volumes).
+    nonisolated static func place(of path: String, downloadFolder: String) -> SoulseekDownload.Whereabouts {
+        let root = URL(fileURLWithPath: downloadFolder, isDirectory: true).standardizedFileURL.path + "/"
+        if URL(fileURLWithPath: path).standardizedFileURL.path.hasPrefix(root) { return .downloads }
+        return .library(volume: MissingFiles.volumeRoot(of: path).map { ($0 as NSString).lastPathComponent })
+    }
+
+    /// The file work, on a utility thread: one listing per folder for the finished files (a
+    /// share answers for a folder in one round trip), and each part file's size.
+    nonisolated private static func lookUpWhereabouts(
+        _ rows: [WhereaboutsQuery], downloadFolder: String
+    ) async -> (places: [UUID: SoulseekDownload.Whereabouts], onDisk: [UUID: UInt64]) {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                var places: [UUID: SoulseekDownload.Whereabouts] = [:]
+                let finished = rows.filter(\.isFinished)
+                let statuses = MissingFiles.check(finished.enumerated().map { (id: Int64($0.offset), path: $0.element.path) })
+                for (offset, row) in finished.enumerated() {
+                    switch statuses[Int64(offset)] {
+                    case .missing?:
+                        places[row.id] = .missing
+                    case .offline?:
+                        places[row.id] = .offline(volume: MissingFiles.volumeRoot(of: row.path).map { ($0 as NSString).lastPathComponent } ?? "")
+                    case nil:
+                        places[row.id] = place(of: row.path, downloadFolder: downloadFolder)
+                    }
+                }
+                var onDisk: [UUID: UInt64] = [:]
+                for row in rows where row.isActive {
+                    onDisk[row.id] = (try? FileManager.default.attributesOfItem(atPath: row.partPath)[.size] as? NSNumber)?.uint64Value ?? 0
+                }
+                continuation.resume(returning: (places, onDisk))
+            }
+        }
     }
 
     /// Waits until the queue as it stands is on disk (for tests; quitting does this too).
@@ -1474,15 +1643,19 @@ final class SoulseekModel {
         guard let queueFile else { return }
         var saved = SoulseekSavedQueue(imports: pendingImportFolders.map(\.path).sorted())
         for download in downloads {
-            let failure: String?
-            switch download.state {
-            case .finished, .cancelled: continue
-            case .failed(let reason): failure = reason
-            default: failure = nil
-            }
-            saved.downloads.append(SoulseekSavedQueue.Download(
+            var row = SoulseekSavedQueue.Download(
                 id: download.id, username: download.username, remotePath: download.remotePath, size: download.size,
-                partPath: download.partURL.path, destinationPath: download.localURL.path, failure: failure))
+                partPath: download.partURL.path, destinationPath: download.localURL.path,
+                added: download.added, ended: download.ended)
+            switch download.state {
+            case .finished: row.outcome = .finished
+            case .cancelled: row.outcome = .cancelled
+            case .failed(let reason):
+                row.outcome = .failed
+                row.failure = reason
+            default: break
+            }
+            saved.downloads.append(row)
         }
         queueFile.save(saved)
     }
@@ -1625,6 +1798,7 @@ final class SoulseekModel {
             guard case .finished(let url) = downloads[index].state, let moved = moves[url.path] else { continue }
             downloads[index].localURL = moved
             downloads[index].state = .finished(moved)
+            downloads[index].whereabouts = Self.place(of: moved.path, downloadFolder: downloadFolderPath)
             changed = true
         }
         if changed { downloadsChanged() }
@@ -1644,10 +1818,12 @@ final class SoulseekModel {
 
         let folder = URL(fileURLWithPath: downloadFolderPath, isDirectory: true)
         let id = UUID()
-        downloads.append(SoulseekDownload(
+        var row = SoulseekDownload(
             id: id, username: username, remotePath: remotePath, size: size,
             partURL: Self.partialFileURL(username: username, remotePath: remotePath, downloadsFolder: folder),
-            localURL: Self.localDestination(for: remotePath, downloadsFolder: folder)))
+            localURL: Self.localDestination(for: remotePath, downloadsFolder: folder))
+        row.added = Date()
+        downloads.append(row)
         downloadsChanged()
         start(id)
     }

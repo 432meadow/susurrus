@@ -422,6 +422,17 @@ import Testing
         #expect(target([Input(id: 1, path: "/d/1.mp3")], folder: "Band - Record (2001) [FLAC]") == "Band/Record")
     }
 
+    @Test func whatThePathAloneSaidIsntTakenForATag() {
+        // An untagged download: its artist came from the download folder's name and its album from its own folder's.
+        let untagged = Input(id: 1, title: "E", artist: "Soulseek", album: "Stranger - Album", path: "/Music/Soulseek/Stranger - Album/01 E.wav")
+        let plan = TagFiling.plan(for: [untagged], isCompilation: false, folderName: "Stranger - Album",
+                                  pathInferred: (artist: "Soulseek", album: "Stranger - Album"))
+        #expect(plan == .plan(.init(target: "Stranger/Album", title: "Stranger – Album", names: [1: "01 E.wav"])))
+        // The same values as real tags (another folder's name) are believed.
+        let tagged = TagFiling.plan(for: [untagged], isCompilation: false, folderName: "Other", pathInferred: (artist: "Soulseek", album: "Other"))
+        if case .plan(let filed) = tagged { #expect(filed.target == "Soulseek/Stranger - Album") } else { Issue.record("no plan") }
+    }
+
     @Test func whatItWontGuess() {
         #expect(TagFiling.plan(for: [Input(id: 1, path: "/d/1.mp3")], isCompilation: false, folderName: "Uploads") == .noArtist)
         let two = [Input(id: 1, artist: "A", album: "One", path: "/d/1.mp3"), Input(id: 2, artist: "A", album: "Two", path: "/d/2.mp3")]
@@ -434,6 +445,110 @@ import Testing
                       Input(id: 3, artist: "X", path: "/d/keeps.flac")]
         guard case .plan(let plan) = TagFiling.plan(for: inputs, isCompilation: false, folderName: "x") else { Issue.record("no plan"); return }
         #expect(plan.names == [1: "1-03 A.flac", 2: "2-03 B.flac"])
+    }
+
+    /// A download folder with albums on disk, some of them in the library, for the tests below.
+    @MainActor private struct DownloadFolderOnDisk {
+        let base: URL
+        let downloads: URL
+        let library: URL
+        let model: AppModel
+
+        init() throws {
+            base = FileManager.default.temporaryDirectory.appendingPathComponent("MoveToLibraryTests-\(UUID().uuidString)")
+            downloads = base.appendingPathComponent("Downloads", isDirectory: true)
+            library = base.appendingPathComponent("Library", isDirectory: true)
+            for path in ["Known - Album/01 A.wav", "Known - Album/02 B.wav", "Box Set/CD1/01 C.wav", "Box Set/CD2/01 D.wav", "Box Set/cover.jpg",
+                         "Stranger - Album/01 E.wav", "Stranger - Album/notes.txt", "Just Scans/front.png", ".incomplete/x.wav.part"] {
+                let url = downloads.appendingPathComponent(path)
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                if path.hasPrefix("Stranger") && path.hasSuffix(".wav") {
+                    try ToneFile.write(to: url, seconds: 0.3)  // the one album that gets scanned has to be real audio
+                } else {
+                    try Data(repeating: 7, count: 100).write(to: url)
+                }
+            }
+            try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+            UserDefaults.standard.set(downloads.path, forKey: "soulseek.downloadFolder")
+            model = AppModel(libraryURL: base.appendingPathComponent("Support/Library.sqlite"))
+            model.soulseek.downloadFolderPath = downloads.path
+            model.soulseek.matchedAlbums = .leave
+            model.soulseek.albumFolderPath = library.path
+            model.releaseCandidates = { _, _, _ in [] }  // nothing on MusicBrainz: everything goes by its tags
+            try model.store?.insert([
+                ScannedTrack(path: downloads.appendingPathComponent("Known - Album/01 A.wav").path, title: "A", artist: "Known", album: "Album"),
+                ScannedTrack(path: downloads.appendingPathComponent("Known - Album/02 B.wav").path, title: "B", artist: "Known", album: "Album"),
+                ScannedTrack(path: downloads.appendingPathComponent("Box Set/CD1/01 C.wav").path, title: "C", artist: "Box", album: "Set", discNumber: 1),
+            ])
+            try model.reload()
+        }
+
+        func tidy() {
+            try? FileManager.default.removeItem(at: base)
+            for key in ["soulseek.downloadFolder", "soulseek.matchedAlbums", "soulseek.albumFolder"] {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+    }
+
+    @Test func albumFoldersOnDiskAreListedWithWhatTheLibraryHas() async throws {
+        let setup = try DownloadFolderOnDisk()
+        defer { setup.tidy() }
+        let folders = AlbumMoveFiles.albumFolders(in: setup.downloads)
+        #expect(folders.map(\.url.lastPathComponent) == ["Box Set", "Known - Album", "Stranger - Album"],
+                "folders without audio and hidden ones are left out")
+        #expect(folders.map(\.audioFiles) == [2, 2, 1], "disc folders count towards their album")
+
+        let albums = await setup.model.albumFoldersOnDisk()
+        #expect(albums.map(\.name) == ["Box Set", "Known - Album", "Stranger - Album"])
+        #expect(albums.map(\.trackCount) == [1, 2, 0])
+        #expect(albums.map(\.isInLibrary) == [true, true, false])
+    }
+
+    @Test func movingAFolderTheLibraryDoesntKnowAddsItFirst() async throws {
+        let setup = try DownloadFolderOnDisk()
+        defer { setup.tidy() }
+        let model = setup.model
+        let stranger = setup.downloads.appendingPathComponent("Stranger - Album", isDirectory: true)
+        #expect(model.tracks(under: stranger).isEmpty)
+        #expect(model.canMoveDownloadToLibrary(folder: stranger), "it's on disk, so it can be added and moved")
+
+        model.moveDownloadToLibrary(folder: stranger)
+        let deadline = Date().addingTimeInterval(20)
+        while model.queuedAlbumMoves.isEmpty, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        await model.albumMoveTask?.value
+        let moved = setup.library.appendingPathComponent("Stranger/Album/01 E.wav")
+        #expect(FileManager.default.fileExists(atPath: moved.path), "added by its folder name, then filed by it")
+        #expect(model.tracks.contains { $0.path == moved.path })
+        #expect(!FileManager.default.fileExists(atPath: stranger.path))
+    }
+
+    @Test func moveAllTakesEveryAlbumThatIsntStillDownloading() async throws {
+        let setup = try DownloadFolderOnDisk()
+        defer { setup.tidy() }
+        let model = setup.model
+        // One album is still coming in: a download that waits for a connection.
+        model.soulseek.download([SlskSearchResult(id: 0, username: "u", path: #"@@u\Box Set\CD2\02 F.wav"#, size: 10, bitrate: nil, isVBR: false,
+                                                  durationSeconds: nil, sampleRate: nil, bitDepth: nil, slotFree: true, averageSpeed: 0, queueLength: 0)])
+        let deadline = Date().addingTimeInterval(10)
+        while model.soulseek.downloads.first?.state != .waitingForConnection, Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(!model.canMoveDownloadToLibrary(folder: setup.downloads.appendingPathComponent("Box Set")))
+
+        model.moveAllDownloadsToLibrary()
+        let told = Date().addingTimeInterval(5)
+        while model.notices.isEmpty, Date() < told { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(model.notices.contains { $0.title.hasPrefix("Moving 2 albums") }, "\(model.notices.map(\.title))")
+        let done = Date().addingTimeInterval(30)
+        while Date() < done {
+            try await Task.sleep(for: .milliseconds(50))
+            if model.preparingAlbumMoves.isEmpty, model.albumMoveTask == nil, model.queuedAlbumMoves.isEmpty,
+               FileManager.default.fileExists(atPath: setup.library.appendingPathComponent("Stranger/Album/01 E.wav").path) { break }
+        }
+        await model.albumMoveTask?.value
+        #expect(FileManager.default.fileExists(atPath: setup.library.appendingPathComponent("Known/Album/01 A.wav").path))
+        #expect(FileManager.default.fileExists(atPath: setup.library.appendingPathComponent("Stranger/Album/01 E.wav").path))
+        #expect(FileManager.default.fileExists(atPath: setup.downloads.appendingPathComponent("Box Set/CD1/01 C.wav").path), "still downloading: left alone")
+        #expect(!FileManager.default.fileExists(atPath: setup.downloads.appendingPathComponent("Known - Album").path))
     }
 
     @Test func existingFoldersKeepTheirSpelling() throws {

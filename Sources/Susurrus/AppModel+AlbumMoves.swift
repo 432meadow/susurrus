@@ -134,18 +134,40 @@ extension AppModel {
 
     // MARK: Move to Library
 
-    /// Whether a finished download's folder can be moved now: it's in the download folder, all
-    /// its transfers are over, it's in the library, and it isn't on its way already.
+    /// Whether an album folder in the download folder can be moved now: all its transfers are
+    /// over, it isn't on its way already, and it's in the library or at least still on disk (one
+    /// the library doesn't know is added first).
     func canMoveDownloadToLibrary(folder: URL) -> Bool {
         let album = downloadAlbumFolder(for: folder).standardizedFileURL
         guard libraryFolder != nil, isInDownloadFolder(album), !preparingAlbumMoves.contains(album.path),
               !queuedAlbumMoves.contains(where: { $0.folder == album.path }),
               !soulseek.downloads.contains(where: { $0.isActive && $0.localURL.path.hasPrefix(album.path + "/") }) else { return false }
-        return !tracks(under: album).isEmpty
+        return !tracks(under: album).isEmpty || AlbumMoveFiles.isFolder(album)
     }
 
-    /// The download folders of those tracks that can be moved now. Finished downloads aren't kept
-    /// between launches, so older ones are only reachable through their tracks.
+    /// An album folder in the download folder: a download that hasn't gone to the library folder,
+    /// whether or not the downloads list remembers it, or the library knows it.
+    struct DownloadedAlbumOnDisk: Identifiable, Equatable {
+        let url: URL
+        /// Audio files on disk, disc folders included.
+        let audioFiles: Int
+        /// How many of them the library has.
+        let trackCount: Int
+        var id: URL { url }
+        var name: String { url.lastPathComponent }
+        var isInLibrary: Bool { trackCount > 0 }
+    }
+
+    /// Every album folder in the download folder, listed from the disk (in the background: the
+    /// folder is local, but there can be a lot of it), with what the library has of each.
+    func albumFoldersOnDisk() async -> [DownloadedAlbumOnDisk] {
+        let root = downloadFolder
+        let found = await BlockingIO.library.run { AlbumMoveFiles.albumFolders(in: root) }
+        return found.map { DownloadedAlbumOnDisk(url: $0.url, audioFiles: $0.audioFiles, trackCount: tracks(under: $0.url).count) }
+    }
+
+    /// The download folders of those tracks that can be moved now. Downloads from before the
+    /// list was kept are only reachable through their tracks.
     func movableDownloadFolders(of tracks: [Track]) -> [URL] {
         let folders = Set(tracks.map { downloadAlbumFolder(for: URL(fileURLWithPath: $0.path).deletingLastPathComponent()).standardizedFileURL })
         return folders.filter(canMoveDownloadToLibrary).sorted { $0.path < $1.path }
@@ -154,23 +176,55 @@ extension AppModel {
     /// Right-click ▸ Move to Library: files a download in the library folder and deletes the
     /// downloaded copy, whatever Settings ▸ Soulseek does with matched albums. With a sure
     /// MusicBrainz match the release's tags and cover go in first; without one the files go by
-    /// their own tags, unchanged.
+    /// their own tags, unchanged. A folder the library doesn't know (another app's download,
+    /// dropped there) is added to the library first.
     func moveDownloadToLibrary(folder: URL) {
+        Task { await prepareMove(of: folder) }
+    }
+
+    /// Move All to Library: every album folder in the download folder that isn't still
+    /// downloading, one after another (each may ask MusicBrainz, which takes requests a second
+    /// apart). Albums that can't be filed say why, as they do one at a time.
+    func moveAllDownloadsToLibrary() {
+        guard libraryFolder != nil else {
+            notify("No library folder", "Choose one in Settings ▸ Soulseek, or add a watched folder.", kind: .error)
+            return
+        }
+        Task {
+            let folders = await albumFoldersOnDisk().map(\.url).filter { canMoveDownloadToLibrary(folder: $0) }
+            guard !folders.isEmpty else {
+                notify("Nothing to move", "No album in the download folder is ready to move.")
+                return
+            }
+            notify("Moving \(folders.count) \(folders.count == 1 ? "album" : "albums") to the library",
+                   "Each is matched on MusicBrainz, or filed by its own tags, then copied to the library folder and deleted here.")
+            for folder in folders { await prepareMove(of: folder) }
+        }
+    }
+
+    /// Looks the album up and queues its move; returns once it's queued, or couldn't be.
+    private func prepareMove(of folder: URL) async {
         guard canMoveDownloadToLibrary(folder: folder) else { return }
         let album = downloadAlbumFolder(for: folder).standardizedFileURL
-        let tracks = tracks(under: album)
         preparingAlbumMoves.insert(album.path)
         cleanedDownloadFolders.insert(album.path)  // so it isn't matched and moved a second time
-        Task {
-            defer { preparingAlbumMoves.remove(album.path) }
-            let inputs = tracks.map(ReleaseMatcher.Input.init)
-            let terms = ReleaseMatcher.searchTerms(for: inputs, folderName: album.lastPathComponent)
-            let best = try? await ReleaseIdentifier.candidates(for: inputs, artist: terms.artist, album: terms.album).first
-            let match = best?.isConfident == true ? best : nil
-            var cover: Data?
-            if let match { cover = await Self.frontCover(for: match.release) }
-            await fileDownload(album, tracks: tracks, match: match, cover: cover)
+        defer { preparingAlbumMoves.remove(album.path) }
+        if tracks(under: album).isEmpty {
+            _ = await addToLibrary([album]).value
+            guard !tracks(under: album).isEmpty else {
+                notify("Nothing in “\(album.lastPathComponent)” could be added to the library",
+                       "It has no audio susurrus can read, so there's nothing to move.", kind: .error)
+                return
+            }
         }
+        let tracks = tracks(under: album)
+        let inputs = tracks.map(ReleaseMatcher.Input.init)
+        let terms = ReleaseMatcher.searchTerms(for: inputs, folderName: album.lastPathComponent)
+        let best = try? await releaseCandidates(inputs, terms.artist, terms.album).first
+        let match = best?.isConfident == true ? best : nil
+        var cover: Data?
+        if let match { cover = await Self.frontCover(for: match.release) }
+        await fileDownload(album, tracks: tracks, match: match, cover: cover)
     }
 
     /// Queues the album for the library folder, by the release when there is one, else by its tags.
@@ -181,7 +235,8 @@ extension AppModel {
             return
         }
         switch TagFiling.plan(for: tracks.map(ReleaseMatcher.Input.init), isCompilation: tracks.contains(where: \.compilation),
-                              folderName: album.lastPathComponent) {
+                              folderName: album.lastPathComponent,
+                              pathInferred: (artist: downloadFolder.lastPathComponent, album: album.lastPathComponent)) {
         case .plan(let plan):
             queueAlbumMove(AlbumMove(folder: album.path, target: plan.target, title: plan.title, names: plan.names))
         case .noArtist:
